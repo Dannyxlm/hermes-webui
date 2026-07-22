@@ -3,6 +3,7 @@ import itertools
 import logging
 import sqlite3
 from contextlib import closing
+from functools import lru_cache
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -41,14 +42,84 @@ def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> 
 
 
 MESSAGING_SOURCES = {
+    'bluebubbles',
+    'dingtalk',
     'discord',
     'email',
+    'feishu',
+    'google_chat',
+    'homeassistant',
+    'irc',
+    'line',
+    'matrix',
+    'mattermost',
+    'ntfy',
+    'photon',
+    'qqbot',
+    'raft',
+    'relay',
+    'signal',
+    'simplex',
+    'slack',
+    'sms',
+    'teams',
+    'telegram',
     'wecom',
     'wecom_callback',
-    'slack',
-    'telegram',
     'weixin',
+    'whatsapp',
+    'whatsapp_cloud',
+    'yuanbao',
 }
+
+# Agent session sources that are execution lanes, local clients, or ambient
+# ingress rather than authenticated person-to-agent messaging adapters.
+_NON_MESSAGING_AGENT_SOURCES = {
+    'acp',
+    'api',
+    'api_server',
+    'batch',
+    'claude-code',
+    'claude_code',
+    'cli',
+    'codex',
+    'cron',
+    'desktop',
+    'external-agent',
+    'external_agent',
+    'gateway',
+    'local',
+    'messaging',
+    'msgraph_webhook',
+    'subagent',
+    'tool',
+    'tui',
+    'unknown',
+    'webhook',
+    'webui',
+}
+
+
+@lru_cache(maxsize=256)
+def is_agent_messaging_source(raw_source: str | None) -> bool:
+    """Return whether *raw_source* names a Hermes messaging platform.
+
+    The fallback set covers platforms known to this WebUI checkout.  When the
+    paired Hermes Agent is newer, its ``Platform`` enum remains authoritative:
+    it accepts built-ins plus bundled or runtime-registered platform plugins,
+    so native sources such as ``photon`` do not require another WebUI patch.
+    """
+    raw = str(raw_source or '').strip().lower()
+    if not raw or raw in _NON_MESSAGING_AGENT_SOURCES:
+        return False
+    if raw in MESSAGING_SOURCES:
+        return True
+    try:
+        from gateway.config import Platform
+
+        return Platform(raw) is not None
+    except (ImportError, TypeError, ValueError):
+        return False
 
 CLI_MIN_UNTITLED_MESSAGE_COUNT = 6
 CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
@@ -58,20 +129,36 @@ DESKTOP_SESSION_MAX_LIMIT = 1000
 SOURCE_LABELS = {
     'acp': 'ACP',
     'api_server': 'API',
+    'bluebubbles': 'BlueBubbles',
     'cli': 'CLI',
     'cron': 'Cron',
     'desktop': 'Desktop',
+    'dingtalk': 'DingTalk',
     'discord': 'Discord',
     'email': 'Email',
-    'wecom': 'WeCom',
-    'wecom_callback': 'WeCom Callback',
+    'feishu': 'Feishu',
+    'google_chat': 'Google Chat',
+    'homeassistant': 'Home Assistant',
+    'matrix': 'Matrix',
+    'mattermost': 'Mattermost',
+    'ntfy': 'ntfy',
+    'photon': 'Photon',
+    'qqbot': 'QQBot',
+    'signal': 'Signal',
     'slack': 'Slack',
+    'sms': 'SMS',
+    'teams': 'Teams',
     'telegram': 'Telegram',
     'tool': 'Tool',
     'tui': 'TUI',
+    'wecom': 'WeCom',
+    'wecom_callback': 'WeCom Callback',
     'webhook': 'Webhook',
     'webui': 'WebUI',
     'weixin': 'Weixin',
+    'whatsapp': 'WhatsApp',
+    'whatsapp_cloud': 'WhatsApp Cloud',
+    'yuanbao': 'Yuanbao',
 }
 
 
@@ -93,7 +180,7 @@ def normalize_agent_session_source(raw_source: str | None) -> dict:
         # invisible in both sidebar buckets (webui skips the state.db
         # projection; cli keeps only CLI-classified rows).
         session_source = 'cli'
-    elif raw in MESSAGING_SOURCES:
+    elif is_agent_messaging_source(raw):
         session_source = 'messaging'
     elif raw == 'cron':
         session_source = 'cron'
@@ -222,8 +309,12 @@ def is_cli_session_row(row: dict) -> bool:
     # runner, never a writable WebUI/CLI session (#5307). Classify it non-CLI so
     # sidebar rows and every is_cli_session_row() consumer keep it out of the
     # CLI/writable treatment.
-    non_cli_sources = MESSAGING_SOURCES | {"cron", "webhook", "tool", "api", "api_server", "subagent"}
+    non_cli_sources = {"cron", "webhook", "tool", "api", "api_server", "subagent"}
     if {source, source_tag, raw_source, source_name, source_label} & non_cli_sources:
+        return False
+    if any(is_agent_messaging_source(candidate) for candidate in (
+        source, source_tag, raw_source, source_name, source_label
+    )):
         return False
     if source == "messaging":
         return False
@@ -252,10 +343,9 @@ def is_cli_session_row(row: dict) -> bool:
     # Keep this conservative to avoid treating messaging sessions as CLI.
     return bool(
         row.get("is_cli_session")
-        and source not in MESSAGING_SOURCES
-        and source_tag not in MESSAGING_SOURCES
-        and raw_source not in MESSAGING_SOURCES
-        and source_name not in MESSAGING_SOURCES
+        and not any(is_agent_messaging_source(candidate) for candidate in (
+            source, source_tag, raw_source, source_name
+        ))
         and _looks_like_default_cli_title(row)
     )
 

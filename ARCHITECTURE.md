@@ -249,6 +249,10 @@ projection with these boundaries:
   collapsed, child-agent rows hidden, archived rows included, and a finite
   recent-page limit. The route may preserve that whole bounded Desktop page;
   it never turns the projection into an unbounded lifetime-history payload.
+- Messaging rows keep the native Hermes `sessions.source` value for display.
+  Source classification delegates to the paired Agent's platform registry, so
+  bundled and runtime-registered plugins such as Photon do not depend on a
+  second hard-coded WebUI allowlist.
 - Every profile scan receives an explicit profile home. Workspace resolution
   must not consult ambient active-profile state. Local paths are resolved and
   stat-checked on the WebUI host; remote-terminal paths use target-side POSIX

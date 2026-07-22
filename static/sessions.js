@@ -2456,13 +2456,34 @@ const _HANDOFF_THRESHOLD = 10;  // conversation rounds
 const _HANDOFF_STORAGE_PREFIX = 'handoff:';
 const _HANDOFF_SUFFIX_DISMISSED_AT = 'dismissed_at';
 const _HANDOFF_SUFFIX_SUMMARY_HANDLED_AT = 'summary_handled_at';
-const _MESSAGING_RAW_SOURCES = new Set(['weixin', 'telegram', 'discord', 'slack', 'email', 'wecom', 'wecom_callback']);
+// Legacy raw-source fallback. The server-provided `session_source=messaging`
+// remains authoritative and is resolved from Hermes' live platform registry,
+// including bundled/runtime plugins that post-date this WebUI checkout.
+const _MESSAGING_RAW_SOURCES = new Set([
+  'bluebubbles', 'dingtalk', 'discord', 'email', 'feishu', 'google_chat',
+  'homeassistant', 'irc', 'line', 'matrix', 'mattermost', 'ntfy', 'photon',
+  'qqbot', 'raft', 'relay', 'signal', 'simplex', 'slack', 'sms', 'teams',
+  'telegram', 'wecom', 'wecom_callback', 'weixin', 'whatsapp',
+  'whatsapp_cloud', 'yuanbao',
+]);
 const _MESSAGING_SOURCE_LABELS = {
+  bluebubbles: 'BlueBubbles',
+  dingtalk: 'DingTalk',
+  google_chat: 'Google Chat',
+  homeassistant: 'Home Assistant',
+  ntfy: 'ntfy',
+  qqbot: 'QQBot',
+  sms: 'SMS',
+  teams: 'Teams',
+  whatsapp: 'WhatsApp',
+  whatsapp_cloud: 'WhatsApp Cloud',
   weixin: 'WeChat',
   telegram: 'Telegram',
   discord: 'Discord',
   slack: 'Slack',
   email: 'Email',
+  photon: 'Photon',
+  signal: 'Signal',
   wecom: 'WeCom',
   wecom_callback: 'WeCom Callback',
 };
@@ -2777,7 +2798,10 @@ function _getChannelLabel(session) {
   // Use source_label from PR #1294 if available
   if (session.source_label) return session.source_label;
   const raw = (session.raw_source || session.source_tag || session.source || '').toLowerCase();
-  return _MESSAGING_SOURCE_LABELS[raw] || raw || '';
+  if (_MESSAGING_SOURCE_LABELS[raw]) return _MESSAGING_SOURCE_LABELS[raw];
+  return raw
+    ? raw.split(/[_-]+/).filter(Boolean).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ')
+    : '';
 }
 
 async function _checkAndShowHandoffHint(sid) {

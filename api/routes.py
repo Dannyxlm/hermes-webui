@@ -42,6 +42,7 @@ from api.agent_runtime import (
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
+    is_agent_messaging_source,
     is_cli_session_row,
     is_cli_session_row_visible,
     read_session_lineage_report,
@@ -1093,7 +1094,7 @@ def _normalize_messaging_source(raw_source) -> str:
 
 
 def _is_known_messaging_source(raw_source) -> bool:
-    return _normalize_messaging_source(raw_source) in _MESSAGING_RAW_SOURCES
+    return is_agent_messaging_source(_normalize_messaging_source(raw_source))
 
 
 def _safe_first(*values):
@@ -9139,7 +9140,7 @@ def _is_cli_session_for_settings(session: dict) -> bool:
     if not session.get("is_cli_session"):
         return False
     source = str(session.get("source") or "").strip().lower()
-    if source in MESSAGING_SOURCES:
+    if is_agent_messaging_source(source):
         return False
     title = str(session.get("title") or "").strip().lower()
     return title in ("", "untitled", "cli", "cli session") or title.endswith(" session") and (
