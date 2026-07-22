@@ -491,9 +491,46 @@ def _all_profiles_query_flag(parsed_url) -> bool:
     return raw in ('1', 'true', 'yes', 'on')
 
 
-def _all_profiles_enabled(parsed_url) -> bool:
-    """Enable aggregate profile reads only when the request asks and mode allows it."""
-    return _all_profiles_query_flag(parsed_url) and not _is_isolated_profile_mode()
+def _request_allows_aggregate_profiles(handler) -> bool:
+    """Return whether this authenticated request may read across profiles.
+
+    Trusted-auth sessions can be pinned to one profile. That binding is an
+    authorization boundary, not merely the active-profile default, so a query
+    string must never widen it. Real requests have already reconciled auth in
+    ``check_auth``; the lazy fallback keeps direct callers and tests compatible.
+    Any auth-resolution failure denies aggregate access.
+    """
+    if handler is None:
+        return True
+
+    missing = object()
+    session_info = getattr(handler, "_trusted_auth_session_reconciled", missing)
+    if session_info is missing:
+        # Synthetic direct callers without an HTTP handler have no authenticated
+        # identity to constrain. Real handlers carry headers and are resolved
+        # here if check_auth has not already cached the request identity.
+        if not hasattr(handler, "headers"):
+            return True
+        try:
+            from api.auth import ensure_trusted_auth_session
+
+            session_info = ensure_trusted_auth_session(handler)
+        except Exception:
+            logger.warning("Unable to resolve request profile scope; denying aggregate access", exc_info=True)
+            return False
+
+    if not isinstance(session_info, dict):
+        return True
+    return not bool(str(session_info.get("bound_profile") or "").strip())
+
+
+def _all_profiles_enabled(parsed_url, handler=None) -> bool:
+    """Enable aggregate reads only when requested, deployable, and authorized."""
+    return bool(
+        _all_profiles_query_flag(parsed_url)
+        and not _is_isolated_profile_mode()
+        and _request_allows_aggregate_profiles(handler)
+    )
 
 
 def _query_flag(parsed_url, name: str) -> bool:
@@ -5109,6 +5146,8 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
             profile=cli_meta.get("profile"),
             created_at=cli_meta.get("created_at"),
             updated_at=cli_meta.get("updated_at"),
+            workspace=cli_meta.get("workspace"),
+            project_id=cli_meta.get("project_id"),
         )
         _apply_source_meta(s)
 
@@ -7927,8 +7966,8 @@ def _is_claimable_cli_source(cli_meta: dict, state_db_source: str = "") -> tuple
     The check is denylist-based: if a source is in any of the
     refused families below, it is non-claimable. Everything else
     (CLI, TUI, Desktop, plus future local agent sources) is allowed.
-    TUI/Desktop sessions whose cli_meta is empty (they don't appear
-    in ``get_cli_sessions()`` due to the CLI cap) fall through to
+    Legacy TUI/Desktop sessions whose cli_meta is empty (for example an
+    older store that cannot provide the rich projection) fall through to
     ``state_db_source``; state.db has a ``source`` column with values
     like ``tui``, ``desktop``, ``cli``, ``cron``, ``claude_code``,
     ``messaging``, ``external_agent``, ``gateway`` (platform-tagged
@@ -8057,6 +8096,7 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             created_at=(cli_meta or {}).get("created_at") or 0,
             updated_at=(cli_meta or {}).get("updated_at") or 0,
             profile=(cli_meta or {}).get("profile"),
+            project_id=(cli_meta or {}).get("project_id"),
             # ``is_cli_flag`` is True for genuine CLI/TUI/Desktop sessions so the
             # sidebar renders the source badge and the client's external-session
             # gating applies. It is False for delegated subagent children (#5307):
@@ -8108,8 +8148,8 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
     msgs = get_cli_session_messages(sid)
     if not msgs:
         return None, "no_foreign_state"
-    # TUI/Desktop sessions often have empty cli_meta (they don't appear in
-    # get_cli_sessions() because of the cap).  Fall back to the state.db
+    # Legacy TUI/Desktop sessions can still have empty cli_meta when their
+    # store cannot provide the rich projection. Fall back to the state.db
     # ``source`` column to make the claim-eligibility check robust and to
     # populate the Session's source-tag metadata so the sidebar still
     # renders the correct badge for these sessions.
@@ -9251,13 +9291,18 @@ CLI_VISIBLE_SESSION_CAP = 20
 
 
 def _cap_recent_cli_sessions(sessions: list[dict], cli_cap: int = CLI_VISIBLE_SESSION_CAP) -> list[dict]:
-    """Keep only the most recent CLI-visible sessions after filtering."""
+    """Cap generic CLI rows while preserving the reader-bounded Desktop page."""
     if cli_cap <= 0:
         return sessions
     kept = []
     cli_seen = 0
     for session in sessions:
-        if _is_cli_session_for_settings(session):
+        source_values = {
+            str(session.get(key) or '').strip().lower()
+            for key in ('source', 'source_tag', 'raw_source', 'source_label')
+        }
+        is_desktop = 'desktop' in source_values
+        if _is_cli_session_for_settings(session) and not is_desktop:
             cli_seen += 1
             if cli_seen > cli_cap:
                 continue
@@ -13117,7 +13162,7 @@ def handle_get(handler, parsed) -> bool:
             show_webhook_sessions = bool(settings.get("show_webhook_sessions"))
             agent_session_source_filter = settings.get("agent_session_source_filter")
             active_profile = profiles_api.get_active_profile_name()
-            all_profiles = _all_profiles_enabled(parsed)
+            all_profiles = _all_profiles_enabled(parsed, handler)
             include_archived = _query_flag(parsed, "include_archived")
             exclude_hidden = _query_flag(parsed, "exclude_hidden")
             archived_limit = _query_positive_int(parsed, "archived_limit", default=None, maximum=2000)
@@ -13182,7 +13227,7 @@ def handle_get(handler, parsed) -> bool:
         active_profile = profiles_api.get_active_profile_name()
         all_projects = load_projects()
         isolated_profile_mode = _is_isolated_profile_mode()
-        all_profiles = _all_profiles_enabled(parsed)
+        all_profiles = _all_profiles_enabled(parsed, handler)
         if all_profiles:
             scoped = all_projects
             other_profile_count = 0
@@ -13470,7 +13515,7 @@ def handle_get(handler, parsed) -> bool:
             if exc.name in ("cron", "cron.jobs"):
                 return j(handler, {"jobs": [], "cron_unavailable": True})
             raise
-        all_profiles = _all_profiles_enabled(parsed)
+        all_profiles = _all_profiles_enabled(parsed, handler)
         jobs = active_jobs + other_jobs if all_profiles else active_jobs
         hidden_other_count = 0 if all_profiles else len(other_jobs)
         return j(handler, {
@@ -15978,6 +16023,8 @@ def handle_post(handler, parsed) -> bool:
                     profile=cli_meta.get("profile"),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
+                    workspace=cli_meta.get("workspace"),
+                    project_id=cli_meta.get("project_id"),
                 )
                 s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
@@ -16805,19 +16852,50 @@ def _session_search_preview(text, query, max_len=124):
     return excerpt
 
 
+_SESSION_SEARCH_DEFAULT_CANDIDATE_LIMIT = 200
+_SESSION_SEARCH_MAX_CANDIDATE_LIMIT = 1000
+_SESSION_SEARCH_DEFAULT_RESULT_LIMIT = 50
+_SESSION_SEARCH_MAX_RESULT_LIMIT = 200
+
+
 def _handle_sessions_search(handler, parsed):
     qs = parse_qs(parsed.query)
     q = qs.get("q", [""])[0].lower().strip()
     content_search = qs.get("content", ["1"])[0] == "1"
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
-    all_profiles = _all_profiles_enabled(parsed)
+    all_profiles = _all_profiles_enabled(parsed, handler)
     sessions = all_sessions()
     if not all_profiles:
         sessions = [
             s for s in sessions
             if _profiles_match(s.get("profile"), active_profile)
         ]
+    candidate_limit = _query_positive_int(
+        parsed,
+        "candidate_limit",
+        default=_SESSION_SEARCH_DEFAULT_CANDIDATE_LIMIT,
+        maximum=_SESSION_SEARCH_MAX_CANDIDATE_LIMIT,
+    )
+    result_limit = _query_positive_int(
+        parsed,
+        "limit",
+        default=_SESSION_SEARCH_DEFAULT_RESULT_LIMIT,
+        maximum=_SESSION_SEARCH_MAX_RESULT_LIMIT,
+    )
+    candidate_limit = max(1, int(candidate_limit or _SESSION_SEARCH_DEFAULT_CANDIDATE_LIMIT))
+    result_limit = max(1, int(result_limit or _SESSION_SEARCH_DEFAULT_RESULT_LIMIT))
+
+    def _activity_timestamp(row):
+        try:
+            return _session_sort_timestamp(row)
+        except (TypeError, ValueError):
+            return 0.0
+
+    sessions.sort(key=_activity_timestamp, reverse=True)
+    candidate_total = len(sessions)
+    candidates = sessions[:candidate_limit]
+    has_more_candidates = candidate_total > len(candidates)
     # Reject a malformed depth instead of letting int() raise ValueError and
     # surface as a confusing 500. Clamp to >= 0 so a negative value can't reach
     # the messages[:depth] slice below — messages[:-n] would silently exclude
@@ -16837,19 +16915,35 @@ def _handle_sessions_search(handler, parsed):
         _search_redact_enabled = True  # fail safe: redact when settings unreadable
     if not q:
         safe_sessions = []
-        for s in sessions:
+        for s in candidates[:result_limit]:
             item = dict(s)
             if isinstance(item.get("title"), str):
                 item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
             _redact_sidebar_title_fields(item, _search_redact_enabled)
             safe_sessions.append(item)
+        result_limit_reached = len(candidates) > len(safe_sessions)
         return j(handler, {
             "sessions": safe_sessions,
+            "count": len(safe_sessions),
             "all_profiles": all_profiles,
             "active_profile": active_profile,
+            "candidate_count": len(candidates),
+            "candidate_total": candidate_total,
+            "candidate_limit": candidate_limit,
+            "candidates_scanned": len(safe_sessions),
+            "transcripts_scanned": 0,
+            "result_limit": result_limit,
+            "result_limit_reached": result_limit_reached,
+            "has_more_candidates": has_more_candidates,
+            "partial": has_more_candidates or result_limit_reached,
         })
     results = []
-    for s in sessions:
+    candidates_scanned = 0
+    transcripts_scanned = 0
+    for s in candidates:
+        if len(results) >= result_limit:
+            break
+        candidates_scanned += 1
         title_match = q in (s.get("title") or "").lower()
         if title_match:
             item = dict(s, match_type="title")
@@ -16860,9 +16954,9 @@ def _handle_sessions_search(handler, parsed):
             continue
         if content_search:
             try:
-                # Scan accessor, not get_session(): a content search walks every
-                # session, and routing that through the LRU would evict the
-                # user's working set on every keystroke-debounced search.
+                # Keep bounded search hydration out of the interactive LRU so
+                # searches cannot evict the user's working set.
+                transcripts_scanned += 1
                 sess = get_session_for_scan(s["session_id"])
                 if sess is None:
                     continue
@@ -16879,14 +16973,24 @@ def _handle_sessions_search(handler, parsed):
                         _redact_sidebar_title_fields(item, _search_redact_enabled)
                         results.append(item)
                         break
-            except (KeyError, Exception):
+            except Exception:
                 pass
+    result_limit_reached = len(results) >= result_limit and candidates_scanned < len(candidates)
     return j(handler, {
         "sessions": results,
         "query": q,
         "count": len(results),
         "all_profiles": all_profiles,
         "active_profile": active_profile,
+        "candidate_count": len(candidates),
+        "candidate_total": candidate_total,
+        "candidate_limit": candidate_limit,
+        "candidates_scanned": candidates_scanned,
+        "transcripts_scanned": transcripts_scanned,
+        "result_limit": result_limit,
+        "result_limit_reached": result_limit_reached,
+        "has_more_candidates": has_more_candidates,
+        "partial": has_more_candidates or result_limit_reached,
     })
 
 
@@ -25536,6 +25640,8 @@ def _handle_session_import_cli(handler, body):
     allow_all_profiles = _request_wants_all_profiles_import(body)
     if allow_all_profiles and _is_isolated_profile_mode():
         return bad(handler, "all_profiles import is not allowed in isolated profile mode", 403)
+    if allow_all_profiles and not _request_allows_aggregate_profiles(handler):
+        return bad(handler, "all_profiles import is not allowed for profile-bound sessions", 403)
     if allow_all_profiles and not requested_profile:
         return bad(handler, "profile is required for all_profiles import", 400)
 
@@ -25660,6 +25766,8 @@ def _handle_session_import_cli(handler, body):
     cli_session_key = cli_meta.get("session_key") if cli_meta else None
     cli_platform = cli_meta.get("platform") if cli_meta else None
     cli_parent_session_id = cli_meta.get("parent_session_id") if cli_meta else None
+    cli_workspace = cli_meta.get("workspace") if cli_meta else None
+    cli_project_id = cli_meta.get("project_id") if cli_meta else None
     cli_read_only = bool((cli_meta or {}).get("read_only"))
     # Delegated subagent children (#5307) are recovered VIEW-ONLY: they must
     # never be materialized as a writable WebUI sidecar via this endpoint, or a
@@ -25689,7 +25797,7 @@ def _handle_session_import_cli(handler, body):
         session_payload = {
             "session_id": sid,
             "title": title,
-            "workspace": str(get_last_workspace()),
+            "workspace": str(cli_workspace or get_last_workspace()),
             "model": model,
             "message_count": len(msgs),
             "created_at": created_at,
@@ -25697,7 +25805,7 @@ def _handle_session_import_cli(handler, body):
             "last_message_at": updated_at or created_at,
             "pinned": False,
             "archived": False,
-            "project_id": None,
+            "project_id": cli_project_id,
             "profile": profile,
             # Subagent children (#5307) are recovered view-only and must NOT be
             # CLI-classified (keeps them out of the frontend _isExternalSession
@@ -25723,6 +25831,8 @@ def _handle_session_import_cli(handler, body):
         created_at=created_at,
         updated_at=updated_at,
         parent_session_id=cli_parent_session_id,
+        workspace=cli_workspace,
+        project_id=cli_project_id,
     )
     if cron_project_id:
         s.project_id = cron_project_id

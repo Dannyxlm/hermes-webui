@@ -187,9 +187,13 @@ def test_conversation_filter_keeps_content_search_results_when_query_is_session_
     assert "function _sessionSearchMergeMatches" in SESSIONS_JS
     assert "function _sessionSearchDirectAndTitleMatches" in SESSIONS_JS
     assert "const sidebarRows=_sessionRowsWithActiveEphemeralSession(_allSessions);" in SESSIONS_JS
-    assert "const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,_contentSearchResults);" in SESSIONS_JS
+    assert "const scopedContentSearchResults=_contentSearchResultKey===_sessionSearchResultKey(searchQueryRaw)" in SESSIONS_JS
+    assert "const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,scopedContentSearchResults);" in SESSIONS_JS
     assert "const allMatched=_ensureActiveSessionRowPresent(searchMatches,sidebarRows);" in SESSIONS_JS
     assert "const directAndTitleMatches=_sessionSearchDirectAndTitleMatches(_allSessions,currentQ);" in SESSIONS_JS
     assert "const directOrTitleIds=new Set(directAndTitleMatches.map(s=>s.session_id));" in SESSIONS_JS
     assert "!directOrTitleIds.has(s.session_id)" in SESSIONS_JS
-    assert "api(`/api/sessions/search?q=${encodeURIComponent(requestedQ)}&content=1&depth=5`)" in SESSIONS_JS
+    assert "depth: String(SESSION_CONTENT_SEARCH_DEPTH)" in SESSIONS_JS
+    assert "limit: String(SESSION_CONTENT_SEARCH_RESULT_LIMIT)" in SESSIONS_JS
+    assert "if(_showAllProfiles) searchParams.set('all_profiles','1');" in SESSIONS_JS
+    assert "api(`/api/sessions/search?${searchParams.toString()}`)" in SESSIONS_JS

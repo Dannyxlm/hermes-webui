@@ -48,7 +48,8 @@ class TestProfileSwitchSpinner:
     def test_optimistic_name_set_before_api_call(self):
         """Chip label must be updated to new name before the API call."""
         fn = self._get_switch_fn()
-        api_call_idx = fn.find("await api('/api/profile/switch'")
+        api_call_idx = fn.find("await _queueProfileSwitchMutation(name)")
+        assert api_call_idx != -1, "Serialized profile-switch request not found."
         opt_name_idx = fn.find("_chipLabel.textContent = name")
         assert opt_name_idx != -1, "No optimistic name update found."
         assert opt_name_idx < api_call_idx, (

@@ -199,7 +199,7 @@ def test_missing_sidecar_returns_default_without_caching_growth(tmp_path):
     session_dir.mkdir()
     with mock.patch("api.models.SESSION_DIR", session_dir):
         meta = models._state_projection_sidecar_metadata("cron_nope_999")
-    assert meta == {"title": None, "archived": False}
+    assert meta == {"title": None, "archived": None}
     # No file → nothing cached (so the cache can't be poisoned by absent files).
     assert len(models._SIDECAR_METADATA_CACHE) == 0
 
@@ -248,13 +248,17 @@ def test_get_last_workspace_called_once_per_build(tmp_path):
 
     ws_calls = {"n": 0}
 
-    def _counting_ws():
+    def _counting_ws(profile_home):
+        assert profile_home == tmp_path
         ws_calls["n"] += 1
         return str(tmp_path)
 
     with (
         mock.patch("api.models.get_claude_code_sessions", return_value=[]),
-        mock.patch("api.models.get_last_workspace", side_effect=_counting_ws),
+        mock.patch(
+            "api.models.get_last_workspace_for_profile_home",
+            side_effect=_counting_ws,
+        ),
         mock.patch("api.models.ensure_cron_project", return_value="cron-pid"),
         mock.patch("api.models.Session.load_metadata_only", return_value=None),
     ):
@@ -262,8 +266,9 @@ def test_get_last_workspace_called_once_per_build(tmp_path):
 
     assert len(result) > 0
     # One resolve for the whole build (lazy, memoized) regardless of row count.
-    assert ws_calls["n"] <= 1, (
-        f"get_last_workspace() called {ws_calls['n']} times for {len(result)} rows"
+    assert ws_calls["n"] == 1, (
+        "get_last_workspace_for_profile_home() called "
+        f"{ws_calls['n']} times for {len(result)} rows"
     )
 
 

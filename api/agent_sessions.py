@@ -1,4 +1,5 @@
 """Shared helpers for reading Hermes Agent sessions from state.db."""
+import itertools
 import logging
 import sqlite3
 from contextlib import closing
@@ -51,12 +52,15 @@ MESSAGING_SOURCES = {
 
 CLI_MIN_UNTITLED_MESSAGE_COUNT = 6
 CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
+DESKTOP_SESSION_DEFAULT_LIMIT = 200
+DESKTOP_SESSION_MAX_LIMIT = 1000
 
 SOURCE_LABELS = {
     'acp': 'ACP',
     'api_server': 'API',
     'cli': 'CLI',
     'cron': 'Cron',
+    'desktop': 'Desktop',
     'discord': 'Discord',
     'email': 'Email',
     'wecom': 'WeCom',
@@ -82,7 +86,7 @@ def normalize_agent_session_source(raw_source: str | None) -> dict:
 
     if raw == 'webui':
         session_source = 'webui'
-    elif raw in {'acp', 'cli', 'tui'}:
+    elif raw in {'acp', 'cli', 'desktop', 'tui'}:
         # 'acp' (Agent Client Protocol adapter — Zed, external device bridges)
         # is a local interactive agent client like the CLI/TUI: its sessions
         # live only in state.db, so classifying it 'other' would leave them
@@ -237,10 +241,10 @@ def is_cli_session_row(row: dict) -> bool:
     if source in {"external_agent", "external-agent"}:
         return True
     if (
-        source_tag in {"acp", "cli", "tui"}
-        or raw_source in {"acp", "cli", "tui"}
-        or source_name in {"acp", "cli", "tui"}
-        or source_label in {"acp", "cli", "tui"}
+        source_tag in {"acp", "cli", "desktop", "tui"}
+        or raw_source in {"acp", "cli", "desktop", "tui"}
+        or source_name in {"acp", "cli", "desktop", "tui"}
+        or source_label in {"acp", "cli", "desktop", "tui"}
     ):
         return True
 
@@ -290,6 +294,12 @@ def is_cli_session_row_visible(row: dict) -> bool:
         # assistant/tool/system rows (e.g. a replayed or aborted turn), so
         # require at least one user turn before surfacing the row.
         return _count_user_turns(row) > 0
+    if "desktop" in interactive_sources:
+        # Desktop's native logical-session reader has already required at least
+        # one message. Older Hermes Agent versions do not expose a per-role
+        # user-turn count here, so do not hide valid Desktop history merely
+        # because that optional aggregate is unavailable.
+        return message_count > 0
 
     if _has_cli_lineage(row):
         return True
@@ -490,12 +500,162 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
     return projected
 
 
+def _is_desktop_api_signature_mismatch(exc: TypeError) -> bool:
+    """Return True only for TypeErrors that identify an older call signature."""
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "unexpected keyword argument",
+            "takes no keyword arguments",
+            "positional-only arguments passed as keyword arguments",
+        )
+    )
+
+
+def _bounded_desktop_session_limit(limit: int | None) -> int:
+    """Normalize one Desktop history page without allowing an unbounded scan."""
+    if limit is None:
+        return DESKTOP_SESSION_DEFAULT_LIMIT
+    try:
+        requested = int(limit)
+    except (TypeError, ValueError):
+        return DESKTOP_SESSION_DEFAULT_LIMIT
+    return min(max(requested, 0), DESKTOP_SESSION_MAX_LIMIT)
+
+
+def read_desktop_session_rows(
+    db_path: Path,
+    log=None,
+    limit: int | None = DESKTOP_SESSION_DEFAULT_LIMIT,
+) -> list[dict]:
+    """Return the first bounded page of native Desktop logical sessions.
+
+    Desktop lists history through ``SessionDB.list_sessions_rich``. Reuse that
+    indexed projection instead of applying WebUI's generic 20-row bridge cap or
+    maintaining another unbounded SQL scan over a potentially large ``state.db``.
+    The native projection already collapses compression continuations, hides
+    subagent children, and includes archived Desktop conversations.
+
+    Older Hermes Agent installs may not expose this API. In that compatibility
+    case, fall back to WebUI's generic projector in strict read-only mode. Native
+    operational failures do not launch a second scan against the same database.
+    """
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return []
+
+    log = log or logger
+    page_limit = _bounded_desktop_session_limit(limit)
+    if page_limit == 0:
+        return []
+
+    db = None
+    native_rows = None
+    compatibility_fallback = False
+    try:
+        try:
+            from hermes_state import SessionDB
+        except ImportError:
+            compatibility_fallback = True
+        except Exception:
+            log.warning("Native Desktop session module failed to load", exc_info=True)
+            return []
+        else:
+            try:
+                db = SessionDB(db_path=db_path, read_only=True)
+            except TypeError as exc:
+                if _is_desktop_api_signature_mismatch(exc):
+                    compatibility_fallback = True
+                else:
+                    log.warning("Native Desktop SessionDB reader failed to open", exc_info=True)
+                    return []
+            except Exception:
+                log.warning("Native Desktop SessionDB reader failed to open", exc_info=True)
+                return []
+            else:
+                list_sessions_rich = getattr(db, "list_sessions_rich", None)
+                if not callable(list_sessions_rich):
+                    compatibility_fallback = True
+                else:
+                    try:
+                        result = list_sessions_rich(
+                            source="desktop",
+                            limit=page_limit,
+                            offset=0,
+                            order_by_last_active=True,
+                            compact_rows=True,
+                            include_children=False,
+                            include_archived=True,
+                            min_message_count=1,
+                        )
+                    except TypeError as exc:
+                        if _is_desktop_api_signature_mismatch(exc):
+                            compatibility_fallback = True
+                        else:
+                            log.warning("Native Desktop session projection failed", exc_info=True)
+                            return []
+                    except Exception:
+                        log.warning("Native Desktop session projection failed", exc_info=True)
+                        return []
+                    else:
+                        if result is None:
+                            log.warning("Native Desktop session projection returned no result")
+                            return []
+                        try:
+                            native_rows = list(itertools.islice(result, page_limit))
+                        except Exception:
+                            log.warning(
+                                "Native Desktop session projection could not be materialized",
+                                exc_info=True,
+                            )
+                            return []
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                log.debug("Failed to close native Desktop SessionDB reader", exc_info=True)
+
+    if compatibility_fallback:
+        log.debug("Native Desktop projection API unavailable; using compatibility reader")
+        try:
+            return read_importable_agent_session_rows(
+                db_path,
+                limit=page_limit,
+                log=log,
+                exclude_sources=None,
+                include_sources=("desktop",),
+                strict_read_only=True,
+            )
+        except Exception:
+            log.warning("Desktop compatibility projection failed", exc_info=True)
+            return []
+
+    projected = []
+    try:
+        for native_row in native_rows or ():
+            row = dict(native_row)
+            row["source"] = row.get("source") or "desktop"
+            row["raw_source"] = row.get("raw_source") or row["source"]
+            row["last_activity"] = row.get("last_active") or row.get("started_at")
+            row["actual_message_count"] = row.get("message_count") or 0
+            row["actual_user_message_count"] = None
+            row["_lineage_tip_id"] = row.get("_lineage_tip_id") or row.get("id")
+            projected.append(_with_normalized_source(row))
+    except Exception:
+        log.warning("Native Desktop session rows were malformed", exc_info=True)
+        return []
+    return projected
+
+
 def read_importable_agent_session_rows(
     db_path: Path,
     limit: int | None = 200,
     log=None,
     exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
     include_sources: tuple[str, ...] | None = None,
+    strict_read_only: bool = False,
 ) -> list[dict]:
     """Return agent sessions projected as importable conversations.
 
@@ -512,6 +672,10 @@ def read_importable_agent_session_rows(
     ``exclude_sources=None``. ``include_sources`` is an additional narrowing
     filter; callers that want an include-only query should explicitly pass
     ``exclude_sources=None`` so the default exclusions do not also apply.
+
+    ``strict_read_only`` is reserved for projections that must never mutate the
+    agent store. It disables both the writable-open fallback and missing-index
+    self-heal while leaving existing callers' compatibility behavior unchanged.
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -522,11 +686,19 @@ def read_importable_agent_session_rows(
     # holding a write-capable handle on the live (multi-GB, WAL) state.db while
     # the agent streams into it adds needless checkpoint/lock surface (#5455).
     # The defensive index self-heal below still runs, but through a separate
-    # short-lived writable connection on the rare missing-index path only.
+    # short-lived writable connection on the rare missing-index path only. A
+    # strict read-only caller skips that compatibility mutation entirely.
     read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
     try:
         conn = sqlite3.connect(read_only_uri, uri=True)
     except sqlite3.Error as exc:
+        if strict_read_only:
+            log.warning(
+                "agent session listing strict read-only open failed for %s; projection unavailable: %s",
+                db_path,
+                exc,
+            )
+            return []
         log.warning(
             "agent session listing read-only open failed for %s; falling back to writable connection: %s",
             db_path,
@@ -564,6 +736,8 @@ def read_importable_agent_session_rows(
         origin_chat_id_expr = _optional_col('origin_chat_id', session_cols)
         origin_user_id_expr = _optional_col('origin_user_id', session_cols)
         platform_expr = _optional_col('platform', session_cols)
+        cwd_expr = _optional_col('cwd', session_cols)
+        archived_expr = _optional_col('archived', session_cols, "0")
         # Older/minimal state.db schemas can have NO ``messages`` table at all,
         # or a ``messages`` table without a ``session_id`` / ``timestamp`` column.
         # The projection SQL below joins ``messages`` and aggregates
@@ -591,7 +765,7 @@ def read_importable_agent_session_rows(
                 messages_index_present = any(str(row[1]) == "idx_messages_session" for row in cur.fetchall())
             except sqlite3.Error:
                 messages_index_present = False
-            if not messages_index_present:
+            if not messages_index_present and not strict_read_only:
                 # Self-heal via a separate writable connection so the common
                 # (index-present) path keeps its read-only handle. On a truly
                 # read-only/locked db this fails and we degrade to the
@@ -606,6 +780,12 @@ def read_importable_agent_session_rows(
                     messages_index_present = True
                 except sqlite3.Error:
                     pass  # read-only db / locked / older schema — degrade gracefully
+
+        # A strict reader must not trade a missing index for an unbounded full
+        # messages-table scan. The denormalized session count/started_at fields
+        # still provide a truthful bounded compatibility page.
+        if strict_read_only and not messages_index_present:
+            use_messages_join = False
 
         if use_messages_join:
             actual_count_expr = f"COUNT(m.{count_col})"
@@ -683,6 +863,8 @@ def read_importable_agent_session_rows(
                    {origin_chat_id_expr},
                    {origin_user_id_expr},
                    {platform_expr},
+                   {cwd_expr},
+                   {archived_expr},
                    {parent_expr},
                    {ended_expr},
                    {end_reason_expr},

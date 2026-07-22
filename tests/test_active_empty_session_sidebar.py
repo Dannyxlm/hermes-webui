@@ -27,7 +27,8 @@ def test_sidebar_search_uses_active_ephemeral_rows_before_filtering():
     render_body = SESSIONS_JS[render_start:render_end]
 
     assert "const sidebarRows=_sessionRowsWithActiveEphemeralSession(_allSessions);" in render_body
-    assert "const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,_contentSearchResults);" in render_body
+    assert "const scopedContentSearchResults=_contentSearchResultKey===_sessionSearchResultKey(searchQueryRaw)" in render_body
+    assert "const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,scopedContentSearchResults);" in render_body
     assert "const allMatched=_ensureActiveSessionRowPresent(searchMatches,sidebarRows);" in render_body
 
 

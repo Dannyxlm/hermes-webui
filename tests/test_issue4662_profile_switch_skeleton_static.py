@@ -1,7 +1,7 @@
-"""Static-source assertions for the #4662 profile-switch loading skeletons.
+"""Regression coverage for the #4662 profile-switch loading skeletons.
 
-These don't execute JS — they assert the source wiring so the behaviour can't
-silently regress:
+Most tests assert source wiring so the behaviour can't silently regress. The
+rapid-switch test executes the real extracted switchToProfile() function:
 
   * switchToProfile() shows both skeletons up front (clears stale content),
     parallelizes the independent list+workspace refreshes, and restores real
@@ -10,14 +10,20 @@ silently regress:
   * style.css defines the skeleton classes, the sheen + fade keyframes, the
     reduced-motion fallback, and dark-mode tokens.
 """
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 PANELS = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
 SESSIONS = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
 WORKSPACE = (REPO_ROOT / "static" / "workspace.js").read_text(encoding="utf-8")
 CSS = (REPO_ROOT / "static" / "style.css").read_text(encoding="utf-8")
+NODE = shutil.which("node")
 
 
 def _switch_body() -> str:
@@ -25,6 +31,17 @@ def _switch_body() -> str:
     # grab a generous slice (the function is long); next top-level function after it
     end = PANELS.index("function openProfileCreate(", start)
     return PANELS[start:end]
+
+
+def _run_node(script: str) -> dict:
+    proc = subprocess.run(
+        [NODE, "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return json.loads(proc.stdout)
 
 
 def _show_session_skeleton_call_idx(body: str) -> int:
@@ -41,7 +58,7 @@ class TestSwitchWiring:
         body = _switch_body()
         skeleton_idx = _show_session_skeleton_call_idx(body)
         # ...and before the awaited /api/profile/switch POST, so stale rows clear immediately
-        assert skeleton_idx < body.index("await api('/api/profile/switch'")
+        assert skeleton_idx < body.index("await _queueProfileSwitchMutation(name)")
 
     def test_shows_workspace_skeleton_when_panel_open(self):
         body = _switch_body()
@@ -62,6 +79,98 @@ class TestSwitchWiring:
         dir_idx = body.index("const dirLoad = loadDir('.');")
         guard_before = body.rfind(guard, 0, dir_idx)
         assert guard_before != -1, "loadDir('.') must be preceded by the switch-generation guard"
+
+    @pytest.mark.skipif(NODE is None, reason="node not on PATH")
+    def test_workspace_refresh_reguards_before_search_restart(self):
+        # Switch alpha reaches the awaited workspace load, then beta completes
+        # end-to-end. Resolving alpha afterward must not let its stale
+        # continuation toast, restart search, reload the visible panel, or start
+        # background refresh work for beta's UI.
+        script = """
+global.window={};
+global.localStorage={removeItem:()=>{}};
+global.S={
+  activeProfile:'default',
+  activeProfileIsDefault:true,
+  session:{session_id:'session-1',workspace:'/workspace',profile:'default'},
+  messages:[],
+};
+global._profileSwitchGeneration=0;
+global._profileSwitchOpeningExistingSession=false;
+global._workspacePanelMode='open';
+global._renamingSid=null;
+global._sessionActionMenu=null;
+global._skillsData=null;
+global._workspaceList=null;
+global._sessionListSkeletonActive=false;
+
+const events={toasts:[],restarts:[],panelLoads:[],backgrounds:[],dirLoads:[]};
+let firstDirResolve=null;
+let dirLoadCount=0;
+
+global.$=()=>null;
+global.t=(key,name)=>`${key}:${name||''}`;
+global.api=async(path,opts={})=>{
+  if(path!=='/api/profile/switch') throw new Error(`unexpected API ${path}`);
+  const name=JSON.parse(opts.body).name;
+  return {active:name,is_default:false};
+};
+global._queueProfileSwitchMutation=(name)=>api('/api/profile/switch',{
+  method:'POST',body:JSON.stringify({name}),timeoutToast:false,
+});
+global._hasPendingProfileSwitchMutation=()=>false;
+global._profileMatchesActiveProfile=()=>true;
+global._invalidateSessionListRenders=()=>{};
+global._setProfileSwitchListEmbargo=()=>{};
+global.showSessionListSkeleton=()=>{};
+global.bumpWorkspaceTreeGen=()=>{};
+global.showWorkspaceTreeSkeleton=()=>{};
+global.closeSessionActionMenu=()=>{};
+global._resetCronUnreadForProfileSwitch=()=>{};
+global.startGatewaySSE=()=>{};
+global.applyBotName=()=>{};
+global._clearPersistedModelState=()=>{};
+global.animateNextSessionListRefresh=()=>{};
+global.renderSessionList=async()=>{};
+global._openProfileSwitchSessionBrowser=()=>{};
+global.syncTopbar=()=>{};
+global.loadDir=()=>{
+  dirLoadCount+=1;
+  events.dirLoads.push(S.activeProfile);
+  if(dirLoadCount===1) return new Promise(resolve=>{firstDirResolve=resolve;});
+  return Promise.resolve();
+};
+global.showToast=(message)=>events.toasts.push({message,profile:S.activeProfile});
+global._restartSessionContentSearchForProfileChange=()=>events.restarts.push(S.activeProfile);
+global._profileSwitchPanelLoad=async()=>{events.panelLoads.push(S.activeProfile);};
+global._refreshProfileSwitchBackground=(generation)=>events.backgrounds.push({generation,profile:S.activeProfile});
+""" + _switch_body() + """
+(async()=>{
+  const first=switchToProfile('alpha');
+  while(!firstDirResolve) await Promise.resolve();
+
+  const second=switchToProfile('beta');
+  const secondResult=await second;
+
+  firstDirResolve();
+  const firstResult=await first;
+
+  process.stdout.write(JSON.stringify({firstResult,secondResult,events}));
+})().catch(error=>{console.error(error);process.exit(1);});
+"""
+        body = _run_node(script)
+
+        assert body["firstResult"] is False
+        assert body["secondResult"] is True
+        assert body["events"] == {
+            "toasts": [
+                {"message": "profile_switched:beta", "profile": "beta"},
+            ],
+            "restarts": ["beta"],
+            "panelLoads": ["beta"],
+            "backgrounds": [{"generation": 2, "profile": "beta"}],
+            "dirLoads": ["alpha", "beta"],
+        }
 
     def test_restores_real_content_on_failure(self):
         body = _switch_body()
@@ -113,12 +222,11 @@ class TestSwitchWiring:
         # api()'s generic "Request timed out" toast can't fire for a superseded or
         # transient-but-eventually-successful switch. Failures surface only through
         # the generation-guarded catch handler, which is the single source of truth.
-        body = _switch_body()
-        post_idx = body.index("await api('/api/profile/switch'")
-        # The same api(...) call expression that targets /api/profile/switch must
-        # carry timeoutToast: false. Scope to a small window around the call.
-        window = body[post_idx: post_idx + 300]
-        assert "timeoutToast: false" in window or "timeoutToast:false" in window.replace(" ", ""), (
+        queue_start = SESSIONS.index("function _queueProfileSwitchMutation(")
+        queue_end = SESSIONS.index("async function _switchProfileForSessionLoad", queue_start)
+        queue_body = SESSIONS[queue_start:queue_end]
+        assert "'/api/profile/switch'" in queue_body
+        assert "timeoutToast:false" in queue_body.replace(" ", ""), (
             "the /api/profile/switch POST must suppress the generic timeout toast"
         )
 
@@ -373,4 +481,3 @@ class TestSwitchRaceGuards:
             "loadDir must re-check the tree generation after BOTH awaited /api/list points "
             "(root render + expanded-dirs prefetch) and discard stale renders"
         )
-

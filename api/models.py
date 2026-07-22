@@ -32,13 +32,19 @@ from api.config import (
     LOCK, STREAMS, STREAMS_LOCK, DEFAULT_WORKSPACE, DEFAULT_MODEL, PROJECTS_FILE, HOME,
     get_effective_default_model, _get_session_agent_lock,
 )
-from api.workspace import get_last_workspace
+from api.workspace import (
+    find_registered_workspace_for_profile_home,
+    get_last_workspace,
+    get_last_workspace_for_profile_home,
+    load_workspaces_for_profile_home,
+)
 from api.usage import prompt_cache_hit_percent
 from api.agent_sessions import (
     _is_continuation_session,
     is_cli_session_row,
     normalize_agent_session_source,
     open_state_db_readonly,
+    read_desktop_session_rows,
     read_importable_agent_session_rows,
     read_session_lineage_metadata,
 )
@@ -6217,6 +6223,8 @@ def import_cli_session(
     created_at=None,
     updated_at=None,
     parent_session_id=None,
+    workspace=None,
+    project_id=None,
 ):
     """Create a new WebUI session populated with CLI/agent messages.
 
@@ -6227,13 +6235,14 @@ def import_cli_session(
     s = Session(
         session_id=session_id,
         title=title,
-        workspace=get_last_workspace(),
+        workspace=workspace or get_last_workspace(),
         model=model,
         messages=messages,
         profile=profile,
         created_at=created_at,
         updated_at=updated_at,
         parent_session_id=parent_session_id,
+        project_id=project_id,
     )
     # #4985: import_cli_session uses an explicit sid (the CLI sidecar's id).
     # If that sid was previously tombstoned as a webui zero-message orphan,
@@ -7030,7 +7039,10 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
     stops being true (metadata moves to another store), this gate would short-
     circuit before the real source — update both together.
     """
-    default = {"title": None, "archived": False}
+    # ``None`` means no WebUI sidecar owns the archive flag. State-backed
+    # projections may then preserve the agent's native archive state; a real
+    # sidecar still supplies an explicit bool and takes precedence.
+    default = {"title": None, "archived": None}
     if not is_safe_session_id(sid):
         return dict(default)
     p = SESSION_DIR / f'{sid}.json'
@@ -7077,6 +7089,7 @@ def _load_cli_sessions_uncached(
     source_filter=None,
     *,
     visible_session_limit: int | None = None,
+    include_desktop_history: bool = True,
     cron_project_limit: int | None | bool = CRON_PROJECT_CHIP_LIMIT,
     webhook_project_limit: int | None | bool = WEBHOOK_PROJECT_CHIP_LIMIT,
     include_claude_code: bool = True,
@@ -7142,6 +7155,17 @@ def _load_cli_sessions_uncached(
             return None
         return _cron_job_names().get(parts[1])
 
+    profile_value = _cli_profile or 'default'
+
+    def _profile_last_workspace():
+        return get_last_workspace_for_profile_home(hermes_home)
+
+    _profile_workspaces_cache: list[list | None] = [None]
+    def _profile_workspaces():
+        if _profile_workspaces_cache[0] is None:
+            _profile_workspaces_cache[0] = load_workspaces_for_profile_home(hermes_home)
+        return _profile_workspaces_cache[0]
+
     # get_last_workspace() reads up to two files + an is_dir()/remote probe and
     # returns the SAME active workspace for every projected row, so calling it
     # per row was redundant I/O on the cold sidebar build (#4842; mirrors the
@@ -7149,8 +7173,28 @@ def _load_cli_sessions_uncached(
     _cli_workspace_cache: list = [None]  # list-as-cell; None = not yet resolved
     def _cli_workspace():
         if _cli_workspace_cache[0] is None:
-            _cli_workspace_cache[0] = str(get_last_workspace())
+            _cli_workspace_cache[0] = str(_profile_last_workspace())
         return _cli_workspace_cache[0]
+
+    _cwd_workspace_cache: dict[str, str | None] = {}
+    def _state_row_registered_workspace(row: dict, source: str) -> str | None:
+        # Only a verified registered Space may confer Project membership. The
+        # current workspace remains a display fallback, not an authority hint.
+        if source != 'desktop':
+            return None
+        raw = str(row.get('cwd') or '').strip()
+        if not raw:
+            return None
+        if raw in _cwd_workspace_cache:
+            return _cwd_workspace_cache[raw]
+
+        result = find_registered_workspace_for_profile_home(
+            hermes_home,
+            raw,
+            workspaces=_profile_workspaces(),
+        )
+        _cwd_workspace_cache[raw] = result
+        return result
 
     _webhook_pid_cache: list[str | None] = [None]
     def _webhook_pid():
@@ -7158,14 +7202,46 @@ def _load_cli_sessions_uncached(
             _webhook_pid_cache[0] = ensure_webhook_project()
         return _webhook_pid_cache[0]
 
-    def _state_row_project_id(sid: str, source: str | None) -> str | None:
+    _desktop_project_ids_cache: list[dict[str, str] | None] = [None]
+    def _desktop_project_ids_by_workspace() -> dict[str, str]:
+        if _desktop_project_ids_cache[0] is None:
+            from api.profiles import _profiles_match
+
+            project_ids: dict[str, str] = {}
+            # Sidebar projection is a read path. Normalize legacy untagged
+            # project ownership on an in-memory copy so named-profile Desktop
+            # rows retain their historical mapping without persisting the
+            # one-time migration while merely listing conversations.
+            projects = [
+                dict(project)
+                for project in load_projects(_migrate=False)
+                if isinstance(project, dict)
+            ]
+            _backfill_project_profiles_if_needed(projects)
+            for project in projects:
+                workspace = str(project.get('workspace') or '').strip()
+                project_id = str(project.get('project_id') or '').strip()
+                if not workspace or not project_id:
+                    continue
+                if not _profiles_match(project.get('profile'), profile_value):
+                    continue
+                project_ids[workspace] = project_id
+            _desktop_project_ids_cache[0] = project_ids
+        return _desktop_project_ids_cache[0]
+
+    def _state_row_project_id(
+        sid: str,
+        source: str | None,
+        registered_workspace: str | None = None,
+    ) -> str | None:
         if is_cron_session(sid, source):
             return _cron_pid()
         if is_webhook_session(sid, source):
             return _webhook_pid()
+        if source == 'desktop' and registered_workspace:
+            return _desktop_project_ids_by_workspace().get(registered_workspace)
         return None
 
-    profile_value = _cli_profile or 'default'
     # A deleted WebUI session is tombstoned (see _record_webui_deleted_session_tombstone)
     # so recovery/audit/claim treat it as gone. The sidebar's own state.db projection
     # must honor the same tombstone, or a deleted WebUI session reappears here as an
@@ -7176,17 +7252,26 @@ def _load_cli_sessions_uncached(
         _deleted_webui_tombstone = _load_webui_deleted_session_tombstone()
     except Exception:
         _deleted_webui_tombstone = frozenset()
-    for row in read_importable_agent_session_rows(
-        db_path,
-        limit=visible_session_limit if visible_session_limit is not None else (
-            CRON_PROJECT_CHIP_LIMIT if source_filter == 'cron'
-            else WEBHOOK_PROJECT_CHIP_LIMIT if source_filter == 'webhook'
-            else CLI_VISIBLE_SESSION_LIMIT
-        ),
-        log=logger,
-        exclude_sources=("cron", "webhook") if source_filter is None else None,
-        include_sources=None if source_filter is None else (source_filter,),
-    ):
+    if source_filter == 'desktop':
+        state_rows = read_desktop_session_rows(db_path, log=logger)
+    else:
+        state_rows = read_importable_agent_session_rows(
+            db_path,
+            limit=visible_session_limit if visible_session_limit is not None else (
+                CRON_PROJECT_CHIP_LIMIT if source_filter == 'cron'
+                else WEBHOOK_PROJECT_CHIP_LIMIT if source_filter == 'webhook'
+                else CLI_VISIBLE_SESSION_LIMIT
+            ),
+            log=logger,
+            exclude_sources=(
+                ("cron", "webhook", "desktop")
+                if include_desktop_history else ("cron", "webhook")
+            ) if source_filter is None else None,
+            include_sources=None if source_filter is None else (source_filter,),
+        )
+        if source_filter is None and include_desktop_history:
+            state_rows.extend(read_desktop_session_rows(db_path, log=logger))
+    for row in state_rows:
         sid = row['id']
         raw_ts = row['last_activity'] or row['started_at']
         # Prefer the CLI session's own profile from the DB; fall back to
@@ -7216,19 +7301,26 @@ def _load_cli_sessions_uncached(
         _sidecar_meta = _state_projection_sidecar_metadata(sid)
         if _sidecar_meta.get('title'):
             _title = _sidecar_meta['title']
-        _archived = bool(_sidecar_meta.get('archived'))
+        sidecar_archived = _sidecar_meta.get('archived')
+        _archived = (
+            bool(row.get('archived'))
+            if sidecar_archived is None
+            else bool(sidecar_archived)
+        )
         _display_title = _title or f'{_source.title()} Session'
+        _registered_workspace = _state_row_registered_workspace(row, _source)
+        _workspace = _registered_workspace or _cli_workspace()
         cli_sessions.append({
             'session_id': sid,
             'title': _display_title,
-            'workspace': _cli_workspace(),
+            'workspace': _workspace,
             'model': row['model'] or None,
             'message_count': row['message_count'] or row['actual_message_count'] or 0,
             'created_at': row['started_at'],
             'updated_at': raw_ts,
             'pinned': False,
             'archived': _archived,
-            'project_id': _state_row_project_id(sid, _source),
+            'project_id': _state_row_project_id(sid, _source, _registered_workspace),
             'profile': profile,
             'source_tag': _source,
             'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),

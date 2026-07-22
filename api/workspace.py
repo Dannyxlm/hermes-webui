@@ -40,14 +40,19 @@ from api.config import (
 def _profile_state_dir() -> Path:
     """Return the webui_state directory for the active profile.
 
-    For the default profile, returns the global STATE_DIR (respects
-    HERMES_WEBUI_STATE_DIR env var for test isolation).
+    For the root/default profile (including a renamed root), returns the global
+    STATE_DIR (respects HERMES_WEBUI_STATE_DIR env var for test isolation).
     For named profiles, returns {profile_home}/webui_state/.
     """
     try:
-        from api.profiles import get_active_profile_name, get_active_hermes_home
+        from api.profiles import (
+            _is_root_profile,
+            get_active_hermes_home,
+            get_active_profile_name,
+        )
+
         name = get_active_profile_name()
-        if name and name != 'default':
+        if name and not _is_root_profile(name):
             d = get_active_hermes_home() / 'webui_state'
             d.mkdir(parents=True, exist_ok=True)
             return d
@@ -145,12 +150,13 @@ def _is_remote_terminal_backend(terminal_cfg: dict | None) -> bool:
     return backend not in ('', 'local')
 
 
-def _remote_terminal_cwd() -> str | None:
-    """Return target-side terminal cwd for remote profiles, without local stat()."""
+def _remote_terminal_cwd(terminal_cfg: dict | None = None) -> str | None:
+    """Return target-side terminal cwd for a remote profile, without local stat()."""
     try:
-        from api.config import get_config
+        if terminal_cfg is None:
+            from api.config import get_config
 
-        terminal_cfg = get_config().get('terminal', {})
+            terminal_cfg = get_config().get('terminal', {})
         if not _is_remote_terminal_backend(terminal_cfg):
             return None
         cwd = str(terminal_cfg.get('cwd') or '').strip()
@@ -162,9 +168,12 @@ def _remote_terminal_cwd() -> str | None:
         return None
 
 
-def _remote_terminal_workspace_candidate(path: str | Path) -> Path | None:
+def _remote_terminal_workspace_candidate(
+    path: str | Path,
+    terminal_cfg: dict | None = None,
+) -> Path | None:
     """Return a non-stat'ed target-side Path when it is under terminal.cwd."""
-    cwd = _remote_terminal_cwd()
+    cwd = _remote_terminal_cwd(terminal_cfg)
     if not cwd:
         return None
     raw = _strip_surrounding_quotes(str(path)).strip()
@@ -241,7 +250,11 @@ def _profile_default_workspace() -> str:
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def _clean_workspace_list(workspaces: list) -> list:
+def _clean_workspace_list(
+    workspaces: list,
+    *,
+    profile_home: Path | None = None,
+) -> list:
     """Sanitize a workspace list:
     - Preserve saved paths even when they are currently missing or inaccessible;
       picker state must not be destroyed by a transient stat/permission failure.
@@ -251,7 +264,21 @@ def _clean_workspace_list(workspaces: list) -> list:
       confusion with the 'default' profile name).
     Returns the cleaned list (may be empty).
     """
-    hermes_profiles = (_home_path() / '.hermes' / 'profiles').resolve()
+    own_profile_dir = None
+    if profile_home is None:
+        hermes_profiles = (_home_path() / '.hermes' / 'profiles').resolve()
+        try:
+            from api.profiles import get_active_hermes_home
+
+            own_profile_dir = get_active_hermes_home().resolve()
+        except Exception:
+            own_profile_dir = None
+    else:
+        own_profile_dir = _safe_resolve(Path(profile_home).expanduser())
+        if own_profile_dir.parent.name == 'profiles':
+            hermes_profiles = own_profile_dir.parent
+        else:
+            hermes_profiles = own_profile_dir / 'profiles'
     result = []
     for w in workspaces:
         path = w.get('path', '')
@@ -266,8 +293,8 @@ def _clean_workspace_list(workspaces: list) -> list:
             p.relative_to(hermes_profiles)
             # p is under ~/.hermes/profiles/ — only skip if it's under a DIFFERENT profile
             try:
-                from api.profiles import get_active_hermes_home
-                own_profile_dir = get_active_hermes_home().resolve()
+                if own_profile_dir is None:
+                    raise ValueError
                 p.relative_to(own_profile_dir)
                 # p is under our own profile dir — keep it
             except (ValueError, Exception):
@@ -365,6 +392,177 @@ def load_workspaces() -> list:
             return migrated
     # Fresh start: single entry from the profile's configured workspace, labeled "Home"
     return [{'path': _profile_default_workspace(), 'name': 'Home'}]
+
+
+def _state_dir_for_profile_home(profile_home: Path) -> Path:
+    """Resolve WebUI state for an explicit profile without changing active TLS."""
+    target = _safe_resolve(Path(profile_home).expanduser())
+    try:
+        from api.profiles import get_hermes_home_for_profile
+
+        default_home = _safe_resolve(Path(get_hermes_home_for_profile('default')).expanduser())
+        if target == default_home:
+            return _GLOBAL_WS_FILE.parent
+    except Exception:
+        pass
+    return target / 'webui_state'
+
+
+def _profile_default_workspace_for_home(profile_home: Path) -> str:
+    """Read one profile's configured workspace without consulting active state."""
+    try:
+        from api.config import get_config_for_profile_home
+
+        cfg = get_config_for_profile_home(profile_home)
+    except Exception:
+        cfg = {}
+    terminal_cfg = cfg.get('terminal', {}) if isinstance(cfg, dict) else {}
+    remote_terminal = _is_remote_terminal_backend(terminal_cfg)
+    if isinstance(cfg, dict):
+        for key in ('workspace', 'default_workspace'):
+            raw = str(cfg.get(key) or '').strip()
+            if not raw:
+                continue
+            if remote_terminal:
+                return raw
+            candidate = _resolve_path(raw)
+            if candidate.is_dir():
+                return str(candidate)
+    if isinstance(terminal_cfg, dict):
+        raw = str(terminal_cfg.get('cwd') or '').strip()
+        if raw and raw != '.':
+            if remote_terminal:
+                return raw
+            candidate = _resolve_path(raw)
+            if candidate.is_dir():
+                return str(candidate)
+    return str(_resolve_path(_BOOT_DEFAULT_WORKSPACE))
+
+
+def load_workspaces_for_profile_home(profile_home: str | Path) -> list:
+    """Read a profile's registered Spaces without mutating files or active profile."""
+    target = _safe_resolve(Path(profile_home).expanduser())
+    ws_file = _state_dir_for_profile_home(target) / 'workspaces.json'
+    if ws_file.exists():
+        try:
+            raw = json.loads(ws_file.read_text(encoding='utf-8'))
+            if isinstance(raw, list):
+                cleaned = _clean_workspace_list(raw, profile_home=target)
+                if cleaned:
+                    return cleaned
+        except Exception:
+            logger.debug("Failed to load workspaces for profile home %s", target)
+    return [{'path': _profile_default_workspace_for_home(target), 'name': 'Home'}]
+
+
+def find_registered_workspace_for_profile_home(
+    profile_home: str | Path,
+    candidate_path: str | Path | None,
+    *,
+    workspaces: list | None = None,
+) -> str | None:
+    """Return the narrowest registered Space containing ``candidate_path``.
+
+    The profile home is explicit so callers projecting another profile never
+    consult thread-local or process-global active-profile state. Remote terminal
+    paths are target-side POSIX paths: validate them against the remote cwd and
+    registered roots without requiring those paths to exist on the WebUI host.
+    Local paths retain the stricter resolve-and-stat checks.
+    """
+    raw_candidate = str(candidate_path or '').strip()
+    if not raw_candidate:
+        return None
+
+    target = _safe_resolve(Path(profile_home).expanduser())
+    try:
+        from api.config import get_config_for_profile_home
+
+        cfg = get_config_for_profile_home(target)
+    except Exception:
+        cfg = {}
+    terminal_cfg = cfg.get('terminal', {}) if isinstance(cfg, dict) else {}
+    registered = workspaces
+    if registered is None:
+        registered = load_workspaces_for_profile_home(target)
+
+    if _is_remote_terminal_backend(terminal_cfg):
+        candidate = _remote_terminal_workspace_candidate(raw_candidate, terminal_cfg)
+        candidate_posix = _as_posix_path(str(candidate)) if candidate is not None else None
+        if candidate_posix is None:
+            return None
+        roots: list[PurePosixPath] = []
+        for workspace in registered:
+            raw_root = str((workspace or {}).get('path') or '').strip()
+            root = _remote_terminal_workspace_candidate(raw_root, terminal_cfg)
+            root_posix = _as_posix_path(str(root)) if root is not None else None
+            if root_posix is not None:
+                roots.append(root_posix)
+        roots.sort(key=lambda path: len(path.parts), reverse=True)
+        for root in roots:
+            if candidate_posix == root or _posix_is_within(candidate_posix, root):
+                return root.as_posix()
+        return None
+
+    try:
+        candidate = _resolve_path(raw_candidate)
+        if not candidate.is_dir():
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    roots: list[Path] = []
+    for workspace in registered:
+        raw_root = str((workspace or {}).get('path') or '').strip()
+        if not raw_root:
+            continue
+        try:
+            root = _resolve_path(raw_root)
+            if root.is_dir():
+                roots.append(root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    roots.sort(key=lambda path: len(path.parts), reverse=True)
+    for root in roots:
+        if candidate == root or _is_within(candidate, root):
+            return str(root)
+    return None
+
+
+def get_last_workspace_for_profile_home(profile_home: str | Path) -> str:
+    """Read a profile's last workspace without falling back to another profile."""
+    target = _safe_resolve(Path(profile_home).expanduser())
+    state_dir = _state_dir_for_profile_home(target)
+    try:
+        from api.config import get_config_for_profile_home
+
+        cfg = get_config_for_profile_home(target)
+    except Exception:
+        cfg = {}
+    terminal_cfg = cfg.get('terminal', {}) if isinstance(cfg, dict) else {}
+    remote_cwd = _remote_terminal_cwd(terminal_cfg)
+
+    def _valid(raw: str) -> str | None:
+        raw = str(raw or '').strip()
+        if not raw:
+            return None
+        if remote_cwd:
+            if _remote_terminal_workspace_candidate(raw, terminal_cfg) is not None:
+                return raw
+            return None
+        try:
+            return raw if Path(raw).is_dir() else None
+        except (OSError, ValueError):
+            return None
+
+    last_workspace_file = state_dir / 'last_workspace.txt'
+    if last_workspace_file.exists():
+        try:
+            workspace = _valid(last_workspace_file.read_text(encoding='utf-8'))
+            if workspace:
+                return workspace
+        except Exception:
+            logger.debug("Failed to read last workspace for profile home %s", target)
+    return _profile_default_workspace_for_home(target)
 
 
 def save_workspaces(workspaces: list) -> None:

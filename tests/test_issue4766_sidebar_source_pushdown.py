@@ -213,6 +213,45 @@ def test_sidebar_source_cli_excludes_webui_rows(monkeypatch):
     assert body["cli_session_count"] == 20
 
 
+def test_sidebar_source_cli_preserves_more_than_twenty_desktop_rows(monkeypatch):
+    rows = _session_rows(webui_count=0, cli_count=25)
+    rows.extend(
+        {
+            "session_id": f"desktop-{index}",
+            "title": f"Desktop Session {index}",
+            "profile": "default",
+            "archived": False,
+            "message_count": 2,
+            "updated_at": 3000 + index,
+            "last_message_at": 3000 + index,
+            "source": "desktop",
+            "raw_source": "desktop",
+            "session_source": "cli",
+            "source_tag": "desktop",
+            "source_label": "Desktop",
+            "is_cli_session": True,
+        }
+        for index in range(25)
+    )
+    _install_common_monkeypatches(monkeypatch, rows)
+
+    handler = _handle_sessions("http://example.com/api/sessions?sidebar_source=cli")
+
+    body = handler.json_body()
+    returned = body["sessions"]
+    desktop_ids = {
+        row["session_id"] for row in returned
+        if row.get("raw_source") == "desktop"
+    }
+    generic_cli_ids = {
+        row["session_id"] for row in returned
+        if row.get("raw_source") == "cli"
+    }
+    assert handler.status == 200
+    assert len(desktop_ids) == 25
+    assert len(generic_cli_ids) == routes.CLI_VISIBLE_SESSION_CAP
+
+
 def test_sidebar_source_omitted_returns_all_rows(monkeypatch):
     rows = _session_rows(webui_count=30, cli_count=20)
     _install_common_monkeypatches(monkeypatch, rows)
@@ -297,6 +336,454 @@ def test_frontend_sends_sidebar_source_param():
     assert "_serverWebuiSessionCount" in src
     assert "_serverCliSessionCount" in src
     assert "function _sessionSourceTabCount(" in src
+    assert "function _sessionSearchProfileScopeKey()" in src
+    assert "function _reloadSessionsForProfileScope(enabled)" in src
+    assert "await _reloadSessionsForProfileScope(next);" in src
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_content_search_rejects_stale_profile_scope_response():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    scope_fn = _extract_function(src, "_sessionSearchProfileScopeKey")
+    result_key_fn = _extract_function(src, "_sessionSearchResultKey")
+    cancel_fn = _extract_function(src, "_cancelSessionContentSearch")
+    filter_fn = _extract_function(src, "filterSessions")
+    script = f"""
+global.S={{ activeProfile: 'default' }};
+global._showAllProfiles=false;
+global._lastSessionSearchQuery='';
+global._hideSearchPreviewsAfterSelect=false;
+global._contentSearchResults=[];
+global._contentSearchResultKey=null;
+global._contentSearchGeneration=0;
+global._contentSearchAbortController=null;
+global._searchDebounceTimer=null;
+global.SESSION_CONTENT_SEARCH_DEPTH=5;
+global.SESSION_CONTENT_SEARCH_RESULT_LIMIT=100;
+global.SESSION_CONTENT_SEARCH_TIMEOUT_MS=10000;
+global._allSessions=[];
+global._archivedSearchPagingQueryActive=false;
+global._showArchived=false;
+let searchValue='needle';
+const timers=[];
+const requests=[];
+global.$=(id)=>id==='sessionSearch'?{{value:searchValue}}:null;
+global.syncSessionSearchClear=()=>{{}};
+global._syncArchivedSearchPagingRefresh=()=>{{}};
+global.renderSessionListFromCache=()=>{{}};
+global.clearTimeout=()=>{{}};
+global.setTimeout=(callback)=>{{timers.push(callback);return timers.length;}};
+global._sessionSearchDirectAndTitleMatches=()=>[];
+global.api=(url)=>new Promise(resolve=>requests.push({{url,resolve}}));
+{scope_fn}
+{result_key_fn}
+{cancel_fn}
+{filter_fn}
+(async()=>{{
+  filterSessions();
+  const first=timers.shift()();
+  _showAllProfiles=true;
+  filterSessions();
+  const second=timers.shift()();
+  requests[0].resolve({{sessions:[{{session_id:'stale',match_type:'content'}}]}});
+  await first;
+  const afterStale=_contentSearchResults.map(row=>row.session_id);
+  requests[1].resolve({{sessions:[{{session_id:'fresh',match_type:'content'}}]}});
+  await second;
+  const final=_contentSearchResults.map(row=>row.session_id);
+  const acceptedKey=_contentSearchResultKey;
+  searchValue='different';
+  filterSessions();
+  console.log(JSON.stringify({{
+    afterStale,
+    final,
+    acceptedKey,
+    afterQueryChange:_contentSearchResults.map(row=>row.session_id),
+    keyAfterQueryChange:_contentSearchResultKey,
+    urls:requests.map(row=>row.url),
+  }}));
+}})();
+"""
+    body = _run_node(script)
+
+    assert body["afterStale"] == []
+    assert body["final"] == ["fresh"]
+    assert body["acceptedKey"] == "all|query:needle"
+    assert body["afterQueryChange"] == []
+    assert body["keyAfterQueryChange"] is None
+    assert "all_profiles=1" not in body["urls"][0]
+    assert "all_profiles=1" in body["urls"][1]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_content_search_aborts_and_rejects_same_key_aba_response():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    scope_fn = _extract_function(src, "_sessionSearchProfileScopeKey")
+    result_key_fn = _extract_function(src, "_sessionSearchResultKey")
+    cancel_fn = _extract_function(src, "_cancelSessionContentSearch")
+    filter_fn = _extract_function(src, "filterSessions")
+    script = f"""
+global.S={{ activeProfile: 'default' }};
+global._showAllProfiles=false;
+global._lastSessionSearchQuery='';
+global._hideSearchPreviewsAfterSelect=false;
+global._contentSearchResults=[];
+global._contentSearchResultKey=null;
+global._contentSearchGeneration=0;
+global._contentSearchAbortController=null;
+global._searchDebounceTimer=null;
+global.SESSION_CONTENT_SEARCH_DEPTH=5;
+global.SESSION_CONTENT_SEARCH_RESULT_LIMIT=100;
+global.SESSION_CONTENT_SEARCH_TIMEOUT_MS=10000;
+global._allSessions=[];
+global._archivedSearchPagingQueryActive=false;
+global._showArchived=false;
+let searchValue='needle';
+let nextTimer=0;
+const timers=new Map();
+const requests=[];
+const controllers=[];
+global.AbortController=class {{
+  constructor() {{
+    this.signal={{aborted:false}};
+    controllers.push(this);
+  }}
+  abort() {{ this.signal.aborted=true; }}
+}};
+global.$=(id)=>id==='sessionSearch'?{{value:searchValue}}:null;
+global.syncSessionSearchClear=()=>{{}};
+global._syncArchivedSearchPagingRefresh=()=>{{}};
+global.renderSessionListFromCache=()=>{{}};
+global.clearTimeout=(id)=>timers.delete(id);
+global.setTimeout=(callback)=>{{
+  const id=++nextTimer;
+  timers.set(id,callback);
+  return id;
+}};
+global._sessionSearchDirectAndTitleMatches=()=>[];
+global.api=(url,opts={{}})=>new Promise(resolve=>requests.push({{url,opts,resolve}}));
+{scope_fn}
+{result_key_fn}
+{cancel_fn}
+{filter_fn}
+const runPendingTimer=()=>{{
+  const entry=timers.entries().next().value;
+  if(!entry) throw new Error('missing timer');
+  timers.delete(entry[0]);
+  return entry[1]();
+}};
+(async()=>{{
+  filterSessions();
+  const first=runPendingTimer();
+
+  searchValue='';
+  filterSessions();
+  searchValue='needle';
+  filterSessions();
+  const second=runPendingTimer();
+
+  requests[1].resolve({{sessions:[{{session_id:'fresh',match_type:'content'}}]}});
+  await second;
+  requests[0].resolve({{sessions:[{{session_id:'stale',match_type:'content'}}]}});
+  await first;
+
+  console.log(JSON.stringify({{
+    final:_contentSearchResults.map(row=>row.session_id),
+    firstAborted:Boolean(controllers[0]&&controllers[0].signal.aborted),
+    urls:requests.map(row=>row.url),
+    options:requests.map(row=>({{
+      timeoutMs:row.opts.timeoutMs,
+      timeoutToast:row.opts.timeoutToast,
+      retries:row.opts.retries,
+      hasSignal:Boolean(row.opts.signal),
+    }})),
+  }}));
+}})();
+"""
+    body = _run_node(script)
+
+    assert body["final"] == ["fresh"]
+    assert body["firstAborted"] is True
+    assert all("depth=5" in url and "limit=100" in url for url in body["urls"])
+    assert body["options"] == [
+        {
+            "timeoutMs": 10000,
+            "timeoutToast": False,
+            "retries": 0,
+            "hasSignal": True,
+        },
+        {
+            "timeoutMs": 10000,
+            "timeoutToast": False,
+            "retries": 0,
+            "hasSignal": True,
+        },
+    ]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_profile_scope_reload_clears_results_refetches_and_restarts_search():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    cancel_fn = _extract_function(src, "_cancelSessionContentSearch")
+    set_scope_fn = _extract_function(src, "_setShowAllProfiles")
+    reload_fn = _ensure_async(
+        _extract_function(src, "_reloadSessionsForProfileScope"),
+        "_reloadSessionsForProfileScope",
+    )
+    script = f"""
+global._showAllProfiles=false;
+global._searchDebounceTimer=99;
+global._contentSearchResults=[{{session_id:'old'}}];
+global._contentSearchResultKey='active:default|query:needle';
+global._contentSearchGeneration=0;
+global._contentSearchAbortController={{abort:()=>calls.push(['abort'])}};
+global.SHOW_ALL_PROFILES_STORAGE_KEY='hermes-show-all-profiles';
+const calls=[];
+global.localStorage={{setItem:(key,value)=>calls.push(['storage',key,value])}};
+global.clearTimeout=(timer)=>calls.push(['clear',timer]);
+global.renderSessionListFromCache=()=>calls.push(['cache']);
+global.renderSessionList=(opts)=>{{calls.push(['list',opts]);return Promise.resolve();}};
+global.filterSessions=()=>calls.push(['search']);
+global.$=(id)=>id==='sessionSearch'?{{value:'needle'}}:null;
+{cancel_fn}
+{set_scope_fn}
+{reload_fn}
+(async()=>{{
+  await _reloadSessionsForProfileScope(true);
+  console.log(JSON.stringify({{
+    showAll:_showAllProfiles,
+    results:_contentSearchResults,
+    key:_contentSearchResultKey,
+    calls,
+  }}));
+}})();
+"""
+    body = _run_node(script)
+
+    assert body["showAll"] is True
+    assert body["results"] == []
+    assert body["key"] is None
+    assert body["calls"] == [
+        ["clear", 99],
+        ["abort"],
+        ["storage", "hermes-show-all-profiles", "1"],
+        ["cache"],
+        ["list", {"deferWhileInteracting": False}],
+        ["search"],
+    ]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_active_profile_switch_restarts_unchanged_content_search():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    cancel_fn = _extract_function(src, "_cancelSessionContentSearch")
+    restart_fn = _extract_function(
+        src, "_restartSessionContentSearchForProfileChange"
+    )
+    script = f"""
+global._showAllProfiles=false;
+global._searchDebounceTimer=41;
+global._contentSearchResults=[{{session_id:'old-profile-match'}}];
+global._contentSearchResultKey='active:alpha|query:needle';
+global._contentSearchGeneration=0;
+global._contentSearchAbortController={{abort:()=>calls.push(['abort'])}};
+global.S={{activeProfile:'beta'}};
+const calls=[];
+global.clearTimeout=(timer)=>calls.push(['clear',timer]);
+global.filterSessions=()=>calls.push(['search',S.activeProfile]);
+global.$=(id)=>id==='sessionSearch'?{{value:'needle'}}:null;
+{cancel_fn}
+{restart_fn}
+const restarted=_restartSessionContentSearchForProfileChange();
+console.log(JSON.stringify({{
+  restarted,
+  results:_contentSearchResults,
+  key:_contentSearchResultKey,
+  calls,
+}}));
+"""
+    body = _run_node(script)
+
+    assert body == {
+        "restarted": True,
+        "results": [],
+        "key": None,
+        "calls": [["clear", 41], ["abort"], ["search", "beta"]],
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_all_profile_search_survives_active_profile_switch():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    restart_fn = _extract_function(
+        src, "_restartSessionContentSearchForProfileChange"
+    )
+    script = f"""
+global._showAllProfiles=true;
+global._searchDebounceTimer=41;
+global._contentSearchResults=[{{session_id:'all-profile-match'}}];
+global._contentSearchResultKey='all|query:needle';
+const calls=[];
+global.clearTimeout=(timer)=>calls.push(['clear',timer]);
+global.filterSessions=()=>calls.push(['search']);
+global.$=(id)=>id==='sessionSearch'?{{value:'needle'}}:null;
+{restart_fn}
+const restarted=_restartSessionContentSearchForProfileChange();
+console.log(JSON.stringify({{
+  restarted,
+  results:_contentSearchResults.map(row=>row.session_id),
+  key:_contentSearchResultKey,
+  calls,
+}}));
+"""
+    body = _run_node(script)
+
+    assert body == {
+        "restarted": False,
+        "results": ["all-profile-match"],
+        "key": "all|query:needle",
+        "calls": [],
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_profile_switch_queue_reconciles_cookie_and_stale_load():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    pending_fn = _extract_function(src, "_hasPendingProfileSwitchMutation")
+    queue_fn = _extract_function(src, "_queueProfileSwitchMutation")
+    reconcile_fn = _ensure_async(
+        _extract_function(src, "_reconcilePendingProfileSwitchForLoad"),
+        "_reconcilePendingProfileSwitchForLoad",
+    )
+    switch_fn = _ensure_async(
+        _extract_function(src, "_switchProfileForSessionLoad"),
+        "_switchProfileForSessionLoad",
+    )
+    script = f"""
+global.S={{activeProfile:'alpha'}};
+global.window={{}};
+global.localStorage={{removeItem:()=>{{}}}};
+global._sessionListSkeletonActive=false;
+global._invalidateSessionListRenders=()=>{{}};
+global._setProfileSwitchListEmbargo=()=>{{}};
+global.showSessionListSkeleton=()=>{{}};
+global._resetCronUnreadForProfileSwitch=()=>{{}};
+global._clearPersistedModelState=()=>{{}};
+global.renderSessionListFromCache=()=>{{}};
+let _profileSwitchMutationTail=Promise.resolve();
+let _profileSwitchMutationPendingCount=0;
+let cookieProfile='alpha';
+const pendingRequests=[];
+let renderResolve;
+let deferRender=false;
+let renderCalls=0;
+let restartCalls=0;
+global.api=(path,opts)=>new Promise(resolve=>{{
+  const target=JSON.parse(opts.body).name;
+  pendingRequests.push({{
+    target,
+    resolve:(data)=>{{cookieProfile=target;resolve(data);}},
+  }});
+}});
+global.renderSessionList=()=>{{
+  renderCalls+=1;
+  if(!deferRender) return Promise.resolve();
+  return new Promise(resolve=>{{renderResolve=resolve;}});
+}};
+global._restartSessionContentSearchForProfileChange=()=>{{restartCalls+=1;}};
+{pending_fn}
+{queue_fn}
+{reconcile_fn}
+{switch_fn}
+(async()=>{{
+  let ownsFirst=true;
+  const first=_switchProfileForSessionLoad('beta',()=>ownsFirst);
+  while(pendingRequests.length<1) await Promise.resolve();
+
+  // The newer load wants the profile already shown in the UI. Because beta's
+  // cookie-changing request is still pending, alpha must still be queued as a
+  // reconciliation mutation instead of taking the ordinary self-switch no-op.
+  ownsFirst=false;
+  const newerLoadReconcile=_reconcilePendingProfileSwitchForLoad('alpha');
+  const queuedBeforeFirstSettles=pendingRequests.map(row=>row.target);
+
+  pendingRequests[0].resolve({{active:'beta',is_default:false}});
+  const firstResult=await first;
+  while(pendingRequests.length<2) await Promise.resolve();
+  const afterFirst={{cookieProfile,activeProfile:S.activeProfile}};
+  pendingRequests[1].resolve({{active:'alpha',is_default:false}});
+  const reconciliationData=await newerLoadReconcile;
+  const reconciled={{
+    firstResult,
+    reconciliationProfile:reconciliationData.active,
+    cookieProfile,
+    activeProfile:S.activeProfile,
+    renderCalls,
+    restartCalls,
+    requestOrder:pendingRequests.map(row=>row.target),
+  }};
+
+  let ownsThird=true;
+  deferRender=true;
+  const third=_switchProfileForSessionLoad('gamma',()=>ownsThird);
+  while(pendingRequests.length<3) await Promise.resolve();
+  pendingRequests[2].resolve({{active:'gamma',is_default:false}});
+  while(!renderResolve) await Promise.resolve();
+  ownsThird=false;
+  renderResolve();
+  const thirdResult=await third;
+  console.log(JSON.stringify({{
+    queuedBeforeFirstSettles,
+    afterFirst,
+    reconciled,
+    staleAfterRender:{{
+      result:thirdResult,
+      cookieProfile,
+      activeProfile:S.activeProfile,
+      renderCalls,
+      restartCalls,
+    }},
+  }}));
+}})();
+"""
+    body = _run_node(script)
+
+    assert body["queuedBeforeFirstSettles"] == ["beta"]
+    assert body["afterFirst"] == {
+        "cookieProfile": "beta",
+        "activeProfile": "alpha",
+    }
+    assert body["reconciled"] == {
+        "firstResult": False,
+        "reconciliationProfile": "alpha",
+        "cookieProfile": "alpha",
+        "activeProfile": "alpha",
+        "renderCalls": 0,
+        "restartCalls": 0,
+        "requestOrder": ["beta", "alpha"],
+    }
+    assert body["staleAfterRender"] == {
+        "result": False,
+        "cookieProfile": "gamma",
+        "activeProfile": "gamma",
+        "renderCalls": 1,
+        "restartCalls": 0,
+    }
+
+
+def test_load_session_reconciles_pending_profile_cookie_before_metadata_fetch():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    load_start = src.index("async function loadSession(sid)")
+    load_end = src.index("async function ", load_start + 1)
+    body = src[load_start:load_end]
+
+    intent_idx = body.index("const _loadProfileIntent=String(S.activeProfile||'default');")
+    reconcile_idx = body.index(
+        "await _reconcilePendingProfileSwitchForLoad(_loadProfileIntent);"
+    )
+    metadata_idx = body.index("/api/session?session_id=")
+
+    assert intent_idx < reconcile_idx < metadata_idx
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -358,6 +845,7 @@ def test_archived_search_input_refetches_uncapped_then_restores_paging():
     archive_filter_fn = _extract_function(src, "_sessionArchivePagingFilterActive")
     query_fn = _extract_function(src, "_sessionListQueryString")
     sync_archive_fn = _extract_function(src, "_syncArchivedSearchPagingRefresh")
+    cancel_fn = _extract_function(src, "_cancelSessionContentSearch")
     filter_fn = _extract_function(src, "filterSessions")
     script = f"""
 global.window = {{ _showCliSessions: false }};
@@ -373,6 +861,9 @@ global._archivedSearchPagingQueryActive = false;
 global._lastSessionSearchQuery = '';
 global._hideSearchPreviewsAfterSelect = false;
 global._contentSearchResults = [];
+global._contentSearchResultKey = null;
+global._contentSearchGeneration = 0;
+global._contentSearchAbortController = null;
 global._searchDebounceTimer = null;
 const calls = [];
 let searchValue = '';
@@ -388,6 +879,7 @@ global.api = () => Promise.resolve({{ sessions: [] }});
 {archive_filter_fn}
 {query_fn}
 {sync_archive_fn}
+{cancel_fn}
 {filter_fn}
 searchValue = 'page two title';
 filterSessions();

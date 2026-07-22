@@ -6926,7 +6926,11 @@ async function switchToProfile(name) {
   // already on this profile, so paths like activateCurrentProfile() (which
   // doesn't pre-check) can't flash a skeleton→restore for a click that changes
   // nothing. (#4662 Opus gate)
-  if (name && name === S.activeProfile) return true;
+  if (
+    name &&
+    name === S.activeProfile &&
+    (typeof _hasPendingProfileSwitchMutation !== 'function' || !_hasPendingProfileSwitchMutation())
+  ) return true;
   S._pendingSessionToolsets=null;
   // Profile switches are per-client cookie/TLS scoped, so a running stream in
   // the current session can safely continue while this tab moves to another
@@ -7006,7 +7010,7 @@ async function switchToProfile(name) {
     // red error while the real switch completes and renders. The catch block below is
     // the single source of truth for switch failure and is gated on _switchGen, so the
     // error surfaces ONLY when the CURRENT switch genuinely fails (@rodboev review, #4662).
-    const data = await api('/api/profile/switch', { method: 'POST', body: JSON.stringify({ name }), timeoutToast: false });
+    const data = await _queueProfileSwitchMutation(name);
     if (_switchGen !== _profileSwitchGeneration) return false;
     S.activeProfile = data.active || name;
     S.activeProfileIsDefault = !!data.is_default;
@@ -7185,9 +7189,21 @@ async function switchToProfile(name) {
         // doesn't strand (#4662 Opus gate).
         clearWorkspaceTreeSkeleton();
       }
+      // loadDir() is generation-aware and resolves quietly when a newer profile
+      // switch supersedes it. Re-check this switch too: otherwise the obsolete
+      // continuation can toast, restart search, and refresh panels for the newer
+      // profile after its workspace await settles.
+      if (_switchGen !== _profileSwitchGeneration) return false;
       showToast(t('profile_switched', name));
     }
 
+    // The authoritative new-profile list is now loaded. If a content-search
+    // query stayed unchanged across the switch, restart it in the new active
+    // profile instead of leaving the old scoped results suppressed forever.
+    // All-profile searches are intentionally preserved by the helper.
+    if (typeof _restartSessionContentSearchForProfileChange === 'function') {
+      _restartSessionContentSearchForProfileChange();
+    }
     await _profileSwitchPanelLoad();
     _refreshProfileSwitchBackground(_switchGen);
     return true;

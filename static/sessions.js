@@ -1626,15 +1626,54 @@ function _sessionProfileMismatchFromError(e){
   return null;
 }
 
-async function _switchProfileForSessionLoad(profile){
+let _profileSwitchMutationTail=Promise.resolve();
+let _profileSwitchMutationPendingCount=0;
+
+function _hasPendingProfileSwitchMutation(){
+  return _profileSwitchMutationPendingCount>0;
+}
+
+function _queueProfileSwitchMutation(profile){
+  const name=String(profile||'').trim();
+  if(!name) return Promise.reject(new Error('missing profile'));
+  _profileSwitchMutationPendingCount+=1;
+  const request=_profileSwitchMutationTail
+    .catch(()=>undefined)
+    .then(()=>api('/api/profile/switch',{
+      method:'POST',
+      body:JSON.stringify({name}),
+      timeoutToast:false,
+    }));
+  // Cookie-setting responses must land in request order. Otherwise an older
+  // response can change the server-side profile after the UI has accepted a
+  // newer switch. Keep the queue alive after failures and let each caller see
+  // its own request result.
+  _profileSwitchMutationTail=request.then(()=>undefined,()=>undefined);
+  return request.finally(()=>{_profileSwitchMutationPendingCount-=1;});
+}
+
+async function _reconcilePendingProfileSwitchForLoad(profile){
+  const name=String(profile||'').trim();
+  if(!name||!_hasPendingProfileSwitchMutation()) return null;
+  return _queueProfileSwitchMutation(name);
+}
+
+async function _switchProfileForSessionLoad(profile,ownsLoad=()=>true){
   const name=String(profile||'').trim();
   if(!name) throw new Error('missing profile');
-  if(name===S.activeProfile) return;
+  if(!ownsLoad()) return false;
+  // A self-switch still has work to do when an older cookie-changing POST is
+  // in flight: queue this target behind it so browser cookie and UI converge.
+  if(name===S.activeProfile&&!_hasPendingProfileSwitchMutation()) return true;
   if(typeof _invalidateSessionListRenders==='function') _invalidateSessionListRenders();
-  if(typeof _setProfileSwitchListEmbargo==='function') _setProfileSwitchListEmbargo(true);
-  if(typeof showSessionListSkeleton==='function') showSessionListSkeleton(name);
   try{
-    const data=await api('/api/profile/switch',{method:'POST',body:JSON.stringify({name}),timeoutToast:false});
+    const data=await _queueProfileSwitchMutation(name);
+    if(!ownsLoad()) return false;
+    // Do not paint switch-owned loading state until the POST still belongs to
+    // this load; otherwise a superseded deep link can strand the newer load on
+    // an obsolete profile skeleton.
+    if(typeof _setProfileSwitchListEmbargo==='function') _setProfileSwitchListEmbargo(true);
+    if(typeof showSessionListSkeleton==='function') showSessionListSkeleton(name);
     S.activeProfile=data.active||name;
     S.activeProfileIsDefault=!!data.is_default;
     if(typeof _resetCronUnreadForProfileSwitch==='function'){
@@ -1650,8 +1689,17 @@ async function _switchProfileForSessionLoad(profile){
     if(typeof startGatewaySSE==='function') startGatewaySSE();
     if(typeof syncTopbar==='function') syncTopbar();
     if(typeof _setProfileSwitchListEmbargo==='function') _setProfileSwitchListEmbargo(false);
-    if(typeof renderSessionList==='function') await renderSessionList();
+    if(typeof renderSessionList==='function'){
+      await renderSessionList();
+      if(!ownsLoad()) return false;
+    }
+    if(!ownsLoad()) return false;
+    if(typeof _restartSessionContentSearchForProfileChange==='function'){
+      _restartSessionContentSearchForProfileChange();
+    }
+    return true;
   }catch(switchErr){
+    if(!ownsLoad()) return false;
     // The switch POST failed, so we're still on the previous profile and its
     // caches are intact. Clear the up-front skeleton and re-render the real
     // list so the sidebar doesn't strand on the skeleton (the #4671 strand bug
@@ -1715,6 +1763,11 @@ async function loadSession(sid){
   const _loadGeneration = ++_loadSessionGeneration;
   const _isCurrentLoad = () => _loadingSessionId === sid && _loadSessionGeneration === _loadGeneration;
   _loadingSessionId = sid;
+  // A newer same-profile load may begin while an older cross-profile POST is
+  // still capable of changing the browser cookie. Record the visible profile
+  // as the newest intent; immediately before metadata fetch we serialize a
+  // corrective switch behind any pending mutation.
+  const _loadProfileIntent=String(S.activeProfile||'default');
   if(currentSid!==sid&&typeof _uploadPendingFilesSyncProgressForSession==='function')_uploadPendingFilesSyncProgressForSession(sid);
   // Reset scroll state for fresh session navigation — the reader expects to
   // land at the bottom of the new transcript, not wherever a stale unpin flag
@@ -1819,6 +1872,11 @@ async function loadSession(sid){
   // Guard against network/server failures to prevent a permanently stuck loading state.
   let data;
   try {
+    await _reconcilePendingProfileSwitchForLoad(_loadProfileIntent);
+    if(!_isCurrentLoad()){
+      _rearmActiveSessionStream();
+      return;
+    }
     data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
   } catch(e) {
     const profileMismatch=_sessionProfileMismatchFromError(e);
@@ -1829,7 +1887,7 @@ async function loadSession(sid){
       }
       try{
         if(typeof showToast==='function') showToast(`Switching to ${profileMismatch.profile} profile for this session…`,2200);
-        await _switchProfileForSessionLoad(profileMismatch.profile);
+        await _switchProfileForSessionLoad(profileMismatch.profile,_isCurrentLoad);
         // Post-await stale-load guard (Codex): the profile switch above does a
         // network POST + session-list re-render, during which the user may have
         // navigated to a different session. If we no longer own the load, bail
@@ -3898,8 +3956,47 @@ function _restoreShowAllProfiles(){
 }
 
 function _setShowAllProfiles(enabled){
-  _showAllProfiles=!!enabled;
+  const next=!!enabled;
+  if(_showAllProfiles===next) return false;
+  _showAllProfiles=next;
+  _cancelSessionContentSearch();
+  _contentSearchResults=[];
+  _contentSearchResultKey=null;
   try{ localStorage.setItem(SHOW_ALL_PROFILES_STORAGE_KEY,_showAllProfiles?'1':'0'); }catch(_e){}
+  if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
+  return true;
+}
+
+function _sessionSearchProfileScopeKey(){
+  if(_showAllProfiles) return 'all';
+  const profile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
+  return 'active:'+profile;
+}
+
+function _sessionSearchResultKey(query){
+  return _sessionSearchProfileScopeKey()+'|query:'+String(query||'').trim();
+}
+
+async function _reloadSessionsForProfileScope(enabled){
+  if(!_setShowAllProfiles(enabled)) return;
+  if(typeof renderSessionList==='function') await renderSessionList({deferWhileInteracting:false});
+  const input=$('sessionSearch');
+  if(input&&String(input.value||'').trim()&&typeof filterSessions==='function') filterSessions();
+}
+
+function _restartSessionContentSearchForProfileChange(){
+  // An all-profile search has the same authority scope before and after an
+  // active-profile switch, so keep its accepted results and in-flight request.
+  if(_showAllProfiles) return false;
+  _cancelSessionContentSearch();
+  _contentSearchResults=[];
+  _contentSearchResultKey=null;
+  const input=$('sessionSearch');
+  if(input&&String(input.value||'').trim()&&typeof filterSessions==='function'){
+    filterSessions();
+    return true;
+  }
+  return false;
 }
 
 _restoreShowAllProfiles();
@@ -5545,7 +5642,10 @@ async function _runRenderSessionListRefresh(opts, _gen){
   // marking for this response even if list gen checks already passed.
   const unreadGen = (typeof _cronPollGeneration === 'number') ? _cronPollGeneration : 0;
   try{
-    if(!($('sessionSearch').value||'').trim()) _contentSearchResults = [];
+    if(!($('sessionSearch').value||'').trim()){
+      _contentSearchResults=[];
+      _contentSearchResultKey=null;
+    }
     const sessionListQS = _sessionListQueryString();
     // #5394: the sidebar session-list GET is idempotent, so 502/503/504 retry
     // must be unconditional. Previously retries/retryStatuses were boot-gated, so
@@ -6272,6 +6372,12 @@ function stopGatewaySSE(){
 
 let _searchDebounceTimer = null;
 let _contentSearchResults = [];  // results from /api/sessions/search content scan
+let _contentSearchResultKey = null;
+let _contentSearchGeneration = 0;
+let _contentSearchAbortController = null;
+const SESSION_CONTENT_SEARCH_DEPTH = 5;
+const SESSION_CONTENT_SEARCH_RESULT_LIMIT = 100;
+const SESSION_CONTENT_SEARCH_TIMEOUT_MS = 10000;
 let _lastSessionSearchQuery = '';
 let _hideSearchPreviewsAfterSelect = false;
 let _archivedSearchPagingQueryActive = false;
@@ -6427,6 +6533,17 @@ function syncSessionSearchClear(){
   clear.hidden=!Boolean(input.value);
 }
 
+function _cancelSessionContentSearch(){
+  clearTimeout(_searchDebounceTimer);
+  _searchDebounceTimer=null;
+  _contentSearchGeneration+=1;
+  if(_contentSearchAbortController){
+    try{ _contentSearchAbortController.abort(); }catch(_e){}
+    _contentSearchAbortController=null;
+  }
+  return _contentSearchGeneration;
+}
+
 function clearSessionSearch(focusInput=true){
   const input=$('sessionSearch');
   if(!input) return;
@@ -6434,6 +6551,9 @@ function clearSessionSearch(focusInput=true){
     input.value='';
     filterSessions();
   }else{
+    _cancelSessionContentSearch();
+    _contentSearchResults=[];
+    _contentSearchResultKey=null;
     syncSessionSearchClear();
   }
   if(focusInput) input.focus();
@@ -6457,23 +6577,62 @@ function filterSessions(){
   const q = ($('sessionSearch').value || '').trim();
   _syncArchivedSearchPagingRefresh(q);
   if(q!==_lastSessionSearchQuery){
+    _contentSearchResults=[];
+    _contentSearchResultKey=null;
     _lastSessionSearchQuery=q;
     _hideSearchPreviewsAfterSelect=false;
   }
   renderSessionListFromCache();
-  clearTimeout(_searchDebounceTimer);
-  if (!q) { _contentSearchResults = []; return; }
+  const requestedGeneration=_cancelSessionContentSearch();
+  if (!q) {
+    _contentSearchResults=[];
+    _contentSearchResultKey=null;
+    return;
+  }
   _searchDebounceTimer = setTimeout(async () => {
+    if(requestedGeneration!==_contentSearchGeneration) return;
     const requestedQ = q;
+    const requestedScope = _sessionSearchProfileScopeKey();
+    const requestedKey = _sessionSearchResultKey(requestedQ);
+    const controller=typeof AbortController!=='undefined'?new AbortController():null;
+    _contentSearchAbortController=controller;
     try {
-      const data = await api(`/api/sessions/search?q=${encodeURIComponent(requestedQ)}&content=1&depth=5`);
+      const searchParams = new URLSearchParams({
+        q: requestedQ,
+        content: '1',
+        depth: String(SESSION_CONTENT_SEARCH_DEPTH),
+        limit: String(SESSION_CONTENT_SEARCH_RESULT_LIMIT),
+      });
+      if(_showAllProfiles) searchParams.set('all_profiles','1');
+      const requestOpts={
+        timeoutMs:SESSION_CONTENT_SEARCH_TIMEOUT_MS,
+        timeoutToast:false,
+        retries:0,
+      };
+      if(controller) requestOpts.signal=controller.signal;
+      // Same scoped URL contract as api(`/api/sessions/search?${searchParams.toString()}`);
+      // requestOpts only adds cancellation, retry, and timeout bounds.
+      const data = await api(`/api/sessions/search?${searchParams.toString()}`,requestOpts);
       const currentQ = ($('sessionSearch').value || '').trim();
-      if(currentQ!==requestedQ) return;
+      if(
+        requestedGeneration!==_contentSearchGeneration
+        ||currentQ!==requestedQ
+        ||_sessionSearchProfileScopeKey()!==requestedScope
+        ||_sessionSearchResultKey(currentQ)!==requestedKey
+      ) return;
       const directAndTitleMatches=_sessionSearchDirectAndTitleMatches(_allSessions,currentQ);
       const directOrTitleIds=new Set(directAndTitleMatches.map(s=>s.session_id));
-      _contentSearchResults = (data.sessions||[]).filter(s => s.match_type === 'content' && !directOrTitleIds.has(s.session_id));
+      _contentSearchResults = (data.sessions||[])
+        .filter(s => s.match_type === 'content' && !directOrTitleIds.has(s.session_id))
+        .slice(0,SESSION_CONTENT_SEARCH_RESULT_LIMIT);
+      _contentSearchResultKey=requestedKey;
       renderSessionListFromCache();
-    } catch(e) { /* ignore */ }
+    } catch(e) {
+      if(e&&e.name==='AbortError') return;
+      // Keep search failures non-disruptive; title/id filtering remains available.
+    } finally {
+      if(_contentSearchAbortController===controller) _contentSearchAbortController=null;
+    }
   }, 350);
 }
 
@@ -7543,7 +7702,10 @@ function renderSessionListFromCache(){
   // Merge direct session-id/link matches, title matches, then content matches (deduped).
   // Direct matches must not disable content search: if a user pasted the same
   // session id into another conversation, that content hit should still appear.
-  const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,_contentSearchResults);
+  const scopedContentSearchResults=_contentSearchResultKey===_sessionSearchResultKey(searchQueryRaw)
+    ?_contentSearchResults
+    :[];
+  const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,scopedContentSearchResults);
   const allMatched=_ensureActiveSessionRowPresent(searchMatches,sidebarRows);
   const {
     cliSessionCount,
@@ -7735,13 +7897,13 @@ function renderSessionListFromCache(){
     const pfToggle=document.createElement('div');
     pfToggle.style.cssText='font-size:10px;padding:4px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.7;';
     pfToggle.textContent='Show '+otherProfileCount+' from other profiles';
-    pfToggle.onclick=()=>{_setShowAllProfiles(true);renderSessionList({deferWhileInteracting:false});};
+    pfToggle.onclick=()=>{void _reloadSessionsForProfileScope(true);};
     list.appendChild(pfToggle);
   } else if(_showAllProfiles){
     const pfToggle=document.createElement('div');
     pfToggle.style.cssText='font-size:10px;padding:4px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.7;';
     pfToggle.textContent='Show active profile only';
-    pfToggle.onclick=()=>{_setShowAllProfiles(false);renderSessionList({deferWhileInteracting:false});};
+    pfToggle.onclick=()=>{void _reloadSessionsForProfileScope(false);};
     list.appendChild(pfToggle);
   }
   // Show/hide archived toggle if there are archived sessions. Archived rows
@@ -8873,8 +9035,7 @@ async function _handleShowAllProfilesStorageEvent(e){
   if(!e || e.key !== SHOW_ALL_PROFILES_STORAGE_KEY) return;
   const next=e.newValue==='1'||e.newValue==='true';
   if(_showAllProfiles===next) return;
-  _showAllProfiles=next;
-  if(typeof renderSessionList==='function') await renderSessionList({deferWhileInteracting:false});
+  await _reloadSessionsForProfileScope(next);
 }
 
 if(typeof window!=='undefined'){

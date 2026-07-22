@@ -75,3 +75,94 @@ def test_search_valid_depth_still_caps_scan():
     captured = _run_search("/api/sessions/search?q=needle&content=1&depth=1")
     assert captured["status"] == 200
     assert captured["payload"]["count"] == 0
+
+
+def _run_bounded_search(query, sessions_meta, get_session_for_scan):
+    import api.routes as routes
+
+    captured = {}
+
+    def fake_j(_handler, payload, status=200, **_kwargs):
+        captured.update(payload=payload, status=status)
+
+    with patch("api.routes.all_sessions", return_value=list(sessions_meta)), patch(
+        "api.routes.get_session_for_scan", side_effect=get_session_for_scan
+    ), patch("api.profiles.get_active_profile_name", return_value="default"), patch(
+        "api.routes.load_settings", return_value={}
+    ), patch("api.routes.j", side_effect=fake_j):
+        routes._handle_sessions_search(SimpleNamespace(), urlparse(query))
+    return captured
+
+
+def test_search_default_candidate_window_only_loads_200_recent_transcripts():
+    sessions = [
+        {
+            "session_id": f"s{index}",
+            "title": "Untitled",
+            "profile": "default",
+            "updated_at": index,
+        }
+        for index in range(205)
+    ]
+    loaded = []
+
+    def get_session_for_scan(session_id):
+        loaded.append(session_id)
+        return SimpleNamespace(messages=[])
+
+    captured = _run_bounded_search(
+        "/api/sessions/search?q=needle&content=1",
+        sessions,
+        get_session_for_scan,
+    )
+    payload = captured["payload"]
+
+    assert captured["status"] == 200
+    assert loaded == [f"s{index}" for index in range(204, 4, -1)]
+    assert payload["candidate_count"] == 200
+    assert payload["candidate_total"] == 205
+    assert payload["candidates_scanned"] == 200
+    assert payload["transcripts_scanned"] == 200
+    assert payload["has_more_candidates"] is True
+    assert payload["partial"] is True
+
+
+def test_search_default_result_limit_stops_after_50_matches():
+    sessions = [
+        {
+            "session_id": f"s{index}",
+            "title": f"needle {index}",
+            "profile": "default",
+            "updated_at": index,
+        }
+        for index in range(60)
+    ]
+
+    captured = _run_bounded_search(
+        "/api/sessions/search?q=needle&content=1",
+        sessions,
+        lambda _session_id: (_ for _ in ()).throw(AssertionError("title matches need no transcript")),
+    )
+    payload = captured["payload"]
+
+    assert captured["status"] == 200
+    assert payload["count"] == 50
+    assert payload["candidate_count"] == 60
+    assert payload["candidates_scanned"] == 50
+    assert payload["transcripts_scanned"] == 0
+    assert payload["result_limit"] == 50
+    assert payload["result_limit_reached"] is True
+    assert payload["has_more_candidates"] is False
+    assert payload["partial"] is True
+
+
+def test_search_query_limits_are_capped_server_side():
+    captured = _run_bounded_search(
+        "/api/sessions/search?q=needle&candidate_limit=999999&limit=999999",
+        [],
+        lambda _session_id: None,
+    )
+
+    assert captured["payload"]["candidate_limit"] == 1000
+    assert captured["payload"]["result_limit"] == 200
+    assert captured["payload"]["partial"] is False

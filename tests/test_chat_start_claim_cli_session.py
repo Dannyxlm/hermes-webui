@@ -456,7 +456,7 @@ def test_helper_materialises_state_db_only_session(
     _make_state_db(isolated_state_db["db"], SID, message_count=3,
                     title="Codex honcho integration",
                     source="tui", cwd="/root")
-    # Inject a CLI metadata record so the helper picks up title/workspace
+    # Inject a CLI metadata record so the helper picks up title/workspace/project
     # from the same lookup the live GET path uses.
     monkeypatch.setattr(
         routes_module, "_lookup_cli_session_metadata",
@@ -464,6 +464,7 @@ def test_helper_materialises_state_db_only_session(
             "session_id": SID,
             "title": "Codex honcho integration",
             "workspace": "/root",
+            "project_id": "trusted-project",
             "model": "MiniMax-M3",
             "source_tag": "tui",
             "raw_source": "tui",
@@ -480,6 +481,7 @@ def test_helper_materialises_state_db_only_session(
     assert sess.title == "Codex honcho integration"
     assert sess.model == "MiniMax-M3"
     assert Path(sess.workspace).name == "root"  # from CLI metadata
+    assert sess.project_id == "trusted-project"
     assert len(sess.messages) == 3
     assert sess.messages[0]["role"] == "user"
     # Greptile #4911 P1: created_at must be populated from state.db

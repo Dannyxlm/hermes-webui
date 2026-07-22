@@ -227,7 +227,10 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Create a public read-only share link for the active conversation from the Control Center; shared pages show a sanitized transcript snapshot without workspace, profile, or live controls
 - Sessions persist across page reloads and SSH tunnel reconnects
 - Browser tab title reflects the active session name
-- CLI session bridge -- CLI sessions from hermes-agent's SQLite store appear in the sidebar with a gold "cli" badge; click to import with full history and reply normally
+- Agent session bridge -- recent CLI, TUI, ACP, and Desktop conversations from Hermes `state.db` appear read-only in the sidebar with their real source label; click to import one into WebUI before replying
+- Desktop history uses Hermes' native logical-session view (compression continuations collapsed, child agents hidden) and a bounded recent window so sidebar cost does not grow with lifetime history
+- Session lists and content search use the active profile by default; **Show all profiles** is an explicit single-user navigation mode and is unavailable to externally profile-bound logins
+- A native Desktop row keeps its Hermes archive state until a WebUI sidecar exists; after import, WebUI-owned title and archive metadata take precedence
 - Token/cost display -- input tokens, output tokens, estimated cost shown per conversation (toggle in Settings or `/usage` command)
 
 ### Workspace file browser

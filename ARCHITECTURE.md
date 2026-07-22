@@ -235,6 +235,37 @@ Session is a plain Python class (not a dataclass, not SQLAlchemy):
 title_from(): takes messages list, finds first user message, returns first 64 chars.
 Called after run_conversation() completes to set the session title retroactively.
 
+#### 4.2.1 Agent-owned session projection
+
+Hermes Agent conversations remain canonical in each profile's `state.db` until
+the user explicitly imports one into WebUI. The sidebar bridge is a read-only
+projection with these boundaries:
+
+- The active profile is the default authority scope. `all_profiles=1` is an
+  explicit single-user navigation mode and is denied for externally
+  profile-bound authenticated sessions.
+- CLI/TUI/ACP rows use the existing bounded generic projection. Desktop rows
+  use Hermes' native logical-session projection with compression continuations
+  collapsed, child-agent rows hidden, archived rows included, and a finite
+  recent-page limit. The route may preserve that whole bounded Desktop page;
+  it never turns the projection into an unbounded lifetime-history payload.
+- Every profile scan receives an explicit profile home. Workspace resolution
+  must not consult ambient active-profile state. Local paths are resolved and
+  stat-checked on the WebUI host; remote-terminal paths use target-side POSIX
+  containment and are not required to exist locally.
+- A registered Space may confer Project membership. The last workspace is only
+  a display fallback and never grants a Project ID.
+- Native archive state is preserved when no WebUI sidecar exists. Once a
+  sidecar exists, its title and archive flag are UI-owned and take precedence.
+- Import is the write boundary: listing/searching state-backed conversations is
+  read-only; clicking Import materializes the WebUI sidecar used for normal
+  WebUI editing and replies.
+
+Content search is separately bounded by a recent candidate window and a result
+limit. The browser aborts superseded requests and uses a monotonic generation so
+an older same-query response cannot overwrite newer results after rapid profile
+or scope changes.
+
 ### 4.3 SSE Streaming Engine
 
 This is the most architecturally interesting part. Two endpoints cooperate:

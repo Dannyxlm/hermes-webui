@@ -122,6 +122,195 @@ def test_all_profiles_disabled_in_isolated_mode(monkeypatch):
     assert routes._all_profiles_enabled(urlparse('/api/sessions?all_profiles=1')) is False
 
 
+def _trusted_auth_handler(bound_profile):
+    return SimpleNamespace(_trusted_auth_session_reconciled={
+        "auth_type": "trusted",
+        "username": "danny",
+        "bound_profile": bound_profile,
+    })
+
+
+def test_all_profiles_disabled_for_profile_bound_trusted_session(monkeypatch):
+    """A query flag cannot widen a trusted session's profile binding."""
+    import api.routes as routes
+
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: False)
+    parsed = urlparse('/api/sessions?all_profiles=1')
+
+    assert routes._all_profiles_enabled(parsed, _trusted_auth_handler("default")) is False
+    assert routes._all_profiles_enabled(parsed, _trusted_auth_handler(None)) is True
+
+
+def test_all_profiles_auth_resolution_failure_fails_closed(monkeypatch):
+    """An unresolved real HTTP identity must not gain aggregate access."""
+    import api.auth as auth
+    import api.routes as routes
+
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: False)
+    monkeypatch.setattr(auth, "ensure_trusted_auth_session", lambda _handler: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    handler = SimpleNamespace(headers={})
+    assert routes._all_profiles_enabled(
+        urlparse('/api/sessions?all_profiles=1'), handler
+    ) is False
+
+
+def test_bound_session_search_ignores_all_profiles_query():
+    """Search must apply the same trusted-session profile boundary as lists."""
+    import api.routes as routes
+
+    captured = {}
+
+    def fake_j(_handler, payload, status=200, **_kwargs):
+        captured.update(payload=payload, status=status)
+
+    sessions = [
+        {"session_id": "active", "title": "needle active", "profile": "default"},
+        {"session_id": "foreign", "title": "needle foreign", "profile": "other"},
+    ]
+    with patch("api.routes.all_sessions", return_value=sessions), \
+         patch("api.profiles.get_active_profile_name", return_value="default"), \
+         patch("api.routes.load_settings", return_value={}), \
+         patch("api.routes.j", side_effect=fake_j):
+        routes._handle_sessions_search(
+            _trusted_auth_handler("default"),
+            urlparse('/api/sessions/search?q=needle&content=0&all_profiles=1'),
+        )
+
+    assert captured["status"] == 200
+    assert captured["payload"]["all_profiles"] is False
+    assert [row["session_id"] for row in captured["payload"]["sessions"]] == ["active"]
+
+
+def test_bound_session_rejects_all_profiles_cli_import(monkeypatch):
+    """A bound session cannot bypass visibility by importing a foreign row."""
+    import api.routes as routes
+
+    captured = {}
+
+    def fake_bad(_handler, message, status=400, **_kwargs):
+        captured.update(message=message, status=status)
+
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: False)
+    monkeypatch.setattr(routes, "bad", fake_bad)
+
+    routes._handle_session_import_cli(
+        _trusted_auth_handler("default"),
+        {"session_id": "foreign", "profile": "other", "all_profiles": True},
+    )
+
+    assert captured == {
+        "message": "all_profiles import is not allowed for profile-bound sessions",
+        "status": 403,
+    }
+
+
+class _NoopRequestDiagnostics:
+    def stage(self, *_args, **_kwargs):
+        return None
+
+    def finish(self):
+        return None
+
+
+def _capture_json_response(monkeypatch, routes):
+    captured = {}
+
+    def fake_j(_handler, payload, status=200, **_kwargs):
+        captured.update(payload=payload, status=status)
+        return True
+
+    monkeypatch.setattr(routes, "j", fake_j)
+    return captured
+
+
+def test_bound_session_list_route_cannot_aggregate_foreign_rows(monkeypatch):
+    import api.routes as routes
+    from api import profiles as profiles_api
+
+    captured = _capture_json_response(monkeypatch, routes)
+    active = {"session_id": "active", "profile": "default"}
+    foreign = {"session_id": "foreign", "profile": "other"}
+
+    monkeypatch.setattr(routes, "load_settings", lambda: {})
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: False)
+    monkeypatch.setattr(
+        routes.RequestDiagnostics,
+        "maybe_start",
+        lambda *_args, **_kwargs: _NoopRequestDiagnostics(),
+    )
+    monkeypatch.setattr(routes, "_session_list_cache_key", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        routes,
+        "_get_cached_session_list_payload",
+        lambda *, builder, **_kwargs: builder(),
+    )
+
+    def fake_build_session_list_cache_payload(*, all_profiles, **_kwargs):
+        rows = [active, foreign] if all_profiles else [active]
+        return {"sessions": rows, "all_profiles": all_profiles}
+
+    monkeypatch.setattr(
+        routes,
+        "_build_session_list_cache_payload",
+        fake_build_session_list_cache_payload,
+    )
+    monkeypatch.setattr(routes, "_session_list_payload_to_response", lambda payload: payload)
+    monkeypatch.setattr(profiles_api, "get_active_profile_name", lambda: "default")
+
+    routes.handle_get(
+        _trusted_auth_handler("default"),
+        urlparse("/api/sessions?all_profiles=1"),
+    )
+
+    assert captured["payload"]["all_profiles"] is False
+    assert captured["payload"]["sessions"] == [active]
+
+
+def test_bound_project_list_route_cannot_aggregate_foreign_rows(monkeypatch):
+    import api.routes as routes
+    from api import profiles as profiles_api
+
+    captured = _capture_json_response(monkeypatch, routes)
+    active = {"project_id": "active", "profile": "default"}
+    foreign = {"project_id": "foreign", "profile": "other"}
+    monkeypatch.setattr(routes, "load_projects", lambda: [active, foreign])
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: False)
+    monkeypatch.setattr(profiles_api, "get_active_profile_name", lambda: "default")
+
+    routes.handle_get(
+        _trusted_auth_handler("default"),
+        urlparse("/api/projects?all_profiles=1"),
+    )
+
+    assert captured["payload"]["all_profiles"] is False
+    assert captured["payload"]["projects"] == [active]
+
+
+def test_bound_cron_list_route_cannot_aggregate_foreign_rows(monkeypatch):
+    import api.routes as routes
+
+    captured = _capture_json_response(monkeypatch, routes)
+    active = {"id": "active", "profile": "default"}
+    foreign = {"id": "foreign", "profile": "other"}
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: False)
+    monkeypatch.setattr(routes, "_ensure_agent_cron_import_path", lambda: None)
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        routes,
+        "_cron_jobs_cross_profile",
+        lambda _profile: ([active], [foreign]),
+    )
+
+    routes.handle_get(
+        _trusted_auth_handler("default"),
+        urlparse("/api/crons?all_profiles=1"),
+    )
+
+    assert captured["payload"]["all_profiles"] is False
+    assert captured["payload"]["jobs"] == [active]
+
+
 # ── No client-side CLI bypass ──────────────────────────────────────────────
 
 
@@ -169,6 +358,12 @@ def test_static_sessions_js_uses_all_profiles_query_when_toggle_on():
     )
     assert "api('/api/projects' + projectQS" in src, (
         "Expected /api/projects fetch to use the variant query"
+    )
+    assert "if(_showAllProfiles) searchParams.set('all_profiles','1');" in src, (
+        "Expected content search to preserve the all-profiles scope"
+    )
+    assert "api(`/api/sessions/search?${searchParams.toString()}`" in src, (
+        "Expected content search to use its scoped query parameters"
     )
 
 
@@ -220,12 +415,26 @@ def test_static_all_profiles_toggle_is_persisted_and_not_reset_by_profile_switch
     assert "const SHOW_ALL_PROFILES_STORAGE_KEY = 'hermes-show-all-profiles';" in sessions_src
     assert "localStorage.setItem(SHOW_ALL_PROFILES_STORAGE_KEY" in sessions_src
     assert "_restoreShowAllProfiles();" in sessions_src
-    assert "_setShowAllProfiles(true);renderSessionList({deferWhileInteracting:false});" in sessions_src
-    assert "_setShowAllProfiles(false);renderSessionList({deferWhileInteracting:false});" in sessions_src
+    assert "void _reloadSessionsForProfileScope(true);" in sessions_src
+    assert "void _reloadSessionsForProfileScope(false);" in sessions_src
+    assert "await _reloadSessionsForProfileScope(next);" in sessions_src
 
     switch_start = panels_src.index("async function switchToProfile(name) {")
     switch_body = panels_src[switch_start:panels_src.index("function openProfileCreate", switch_start)]
     assert "_showAllProfiles = false" not in switch_body
+    assert "_restartSessionContentSearchForProfileChange();" in switch_body
+
+    deep_switch_start = sessions_src.index(
+        "async function _switchProfileForSessionLoad("
+    )
+    deep_switch_body = sessions_src[
+        deep_switch_start:sessions_src.index("async function loadSession(sid)", deep_switch_start)
+    ]
+    render_idx = deep_switch_body.index("await renderSessionList();")
+    restart_idx = deep_switch_body.index(
+        "_restartSessionContentSearchForProfileChange();"
+    )
+    assert restart_idx > render_idx
 
 
 # ── SHOULD-FIX #2: profile filter must run BEFORE messaging-source dedupe ──
