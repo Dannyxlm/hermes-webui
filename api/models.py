@@ -7501,8 +7501,17 @@ def get_cli_sessions(
 
     Returns empty list if the SQLite DB is missing or any error occurs -- the
     bridge is purely additive and never crashes the WebUI.
+
+    Unfiltered callers (session-open metadata lookup via ``get_cli_sessions()``
+    with no ``source_filter``) are forced onto the cheap Desktop-only reader so
+    they never GROUP-BY the multi-GB messages store or scan Claude Code rows.
+    Explicit source filters retain their requested scope.
     """
     source_filter = _normalize_cli_session_source_filter(source_filter)
+    if source_filter is None:
+        # Session-open / default bridge path: Desktop-only, no Claude Code scan.
+        source_filter = "desktop"
+        include_claude_code = False
     if all_profiles:
         contexts, context_cache_key = _all_profiles_cli_contexts()
         db_path = "all profiles"

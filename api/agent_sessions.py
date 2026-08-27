@@ -2,6 +2,7 @@
 import itertools
 import logging
 import sqlite3
+import time
 from contextlib import closing
 from functools import lru_cache
 from pathlib import Path
@@ -123,8 +124,11 @@ def is_agent_messaging_source(raw_source: str | None) -> bool:
 
 CLI_MIN_UNTITLED_MESSAGE_COUNT = 6
 CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
-DESKTOP_SESSION_DEFAULT_LIMIT = 200
-DESKTOP_SESSION_MAX_LIMIT = 1000
+# Hermex Desktop sidebar/open path: newest 15 logical sessions within 7 days.
+# Sessions-table-only projection; never scan the multi-GB messages store.
+DESKTOP_SESSION_DEFAULT_LIMIT = 15
+DESKTOP_SESSION_MAX_LIMIT = 15
+DESKTOP_SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 SOURCE_LABELS = {
     'acp': 'ACP',
@@ -603,6 +607,27 @@ def _is_desktop_api_signature_mismatch(exc: TypeError) -> bool:
     )
 
 
+def _as_epoch(value) -> float:
+    """Coerce a sessions-table timestamp to epoch seconds (0.0 on failure)."""
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
 def _bounded_desktop_session_limit(limit: int | None) -> int:
     """Normalize one Desktop history page without allowing an unbounded scan."""
     if limit is None:
@@ -614,6 +639,235 @@ def _bounded_desktop_session_limit(limit: int | None) -> int:
     return min(max(requested, 0), DESKTOP_SESSION_MAX_LIMIT)
 
 
+def _project_bounded_desktop_rows(
+    db_path: Path,
+    log=None,
+    limit: int | None = DESKTOP_SESSION_DEFAULT_LIMIT,
+) -> list[dict] | None:
+    """Project recent logical Desktop sessions without reading ``messages``.
+
+    Hermes Agent's native rich-list query is exact but can recursively compute
+    message-table activity for every Desktop compression root before applying
+    LIMIT. On large ``state.db`` installs that turns a 15-row sidebar refresh
+    into a multi-second scan. ``sessions.last_activity_at`` is already maintained
+    by Hermes, so this projection rebuilds the logical-session view from the
+    sessions table only.
+
+    Returns:
+      - ``list`` on success (possibly empty)
+      - ``None`` when the installed schema cannot support the fast projection
+        (callers may fall back to a compatibility path)
+    """
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return []
+    log = log or logger
+    try:
+        page_limit = _bounded_desktop_session_limit(limit)
+    except Exception:
+        page_limit = DESKTOP_SESSION_DEFAULT_LIMIT
+    if page_limit == 0:
+        return []
+
+    conn = None
+    try:
+        conn = open_state_db_readonly(db_path, log=log)
+        conn.row_factory = sqlite3.Row
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        required = {"id", "source", "started_at"}
+        if not required.issubset(columns):
+            return None
+
+        def optional(name: str, fallback: str = "NULL") -> str:
+            return name if name in columns else f"{fallback} AS {name}"
+
+        marker_columns = (
+            "json_extract(COALESCE(model_config, '{}'), '$._branched_from') AS _branched_from, "
+            "json_extract(COALESCE(model_config, '{}'), '$._delegate_from') AS _delegate_from"
+            if "model_config" in columns
+            else "NULL AS _branched_from, NULL AS _delegate_from"
+        )
+        activity_expr = (
+            "COALESCE(last_activity_at, started_at) AS _row_activity"
+            if "last_activity_at" in columns
+            else "started_at AS _row_activity"
+        )
+        select_columns = ", ".join(
+            (
+                "id",
+                "source",
+                optional("title"),
+                optional("model"),
+                optional("message_count", "0"),
+                "started_at",
+                optional("ended_at"),
+                optional("end_reason"),
+                optional("parent_session_id"),
+                optional("archived", "0"),
+                optional("hidden", "0"),
+                optional("pinned", "0"),
+                optional("cwd"),
+                activity_expr,
+                marker_columns,
+            )
+        )
+        # Intentionally the only data query: one source slice, no messages table,
+        # recursive CTE, preview, or payload blobs.
+        raw_rows = [
+            dict(row)
+            for row in conn.execute(
+                f"SELECT {select_columns} FROM sessions WHERE source = ?",
+                ("desktop",),
+            ).fetchall()
+        ]
+    except Exception:
+        log.debug("Fast Desktop projection unavailable", exc_info=True)
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                log.debug("Fast Desktop reader close failed", exc_info=True)
+
+    by_id = {str(row["id"]): row for row in raw_rows if row.get("id")}
+    children: dict[str, list[dict]] = {}
+    for row in raw_rows:
+        parent_id = row.get("parent_session_id")
+        if parent_id:
+            children.setdefault(str(parent_id), []).append(row)
+
+    def activity(row: dict) -> float:
+        return _as_epoch(row.get("_row_activity") or row.get("started_at"))
+
+    def is_branch(row: dict) -> bool:
+        if row.get("_branched_from") is not None:
+            return True
+        parent = by_id.get(str(row.get("parent_session_id") or ""))
+        return bool(
+            parent
+            and parent.get("end_reason") == "branched"
+            and _as_epoch(row.get("started_at")) >= _as_epoch(parent.get("ended_at"))
+        )
+
+    def continuation_children(row: dict) -> list[dict]:
+        if row.get("end_reason") != "compression":
+            return []
+        return [
+            child
+            for child in children.get(str(row.get("id") or ""), ())
+            if child.get("_branched_from") is None
+            and child.get("_delegate_from") is None
+            and str(child.get("source") or "").lower() != "tool"
+        ]
+
+    def chain_rows(root: dict) -> list[dict]:
+        found = []
+        stack = [root]
+        seen: set[str] = set()
+        while stack and len(seen) < 1000:
+            row = stack.pop()
+            row_id = str(row.get("id") or "")
+            if not row_id or row_id in seen:
+                continue
+            seen.add(row_id)
+            found.append(row)
+            stack.extend(continuation_children(row))
+        return found
+
+    def compression_tip(root: dict) -> dict:
+        current = root
+        seen = {str(root.get("id") or "")}
+        for _ in range(100):
+            candidates = continuation_children(current)
+            if not candidates:
+                return current
+            # Match Hermes preference: continuing chains, then live rows,
+            # then stale closed siblings; use denormalized activity for ties.
+            chosen = max(
+                candidates,
+                key=lambda child: (
+                    0
+                    if child.get("end_reason") == "compression"
+                    else -1
+                    if child.get("ended_at") is None
+                    else -2,
+                    activity(child),
+                    _as_epoch(child.get("started_at")),
+                    str(child.get("id") or ""),
+                ),
+            )
+            chosen_id = str(chosen.get("id") or "")
+            if not chosen_id or chosen_id in seen:
+                return current
+            seen.add(chosen_id)
+            current = chosen
+        return current
+
+    candidates = []
+    for root in raw_rows:
+        try:
+            if int(root.get("message_count") or 0) < 1:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if root.get("_delegate_from") is not None:
+            continue
+        if root.get("parent_session_id") and not is_branch(root):
+            continue
+        chain = chain_rows(root)
+        effective_activity = max((activity(row) for row in chain), default=activity(root))
+        candidates.append((effective_activity, root))
+
+    candidates.sort(
+        key=lambda item: (
+            item[0],
+            _as_epoch(item[1].get("started_at")),
+            str(item[1].get("id") or ""),
+        ),
+        reverse=True,
+    )
+
+    cutoff = time.time() - DESKTOP_SESSION_MAX_AGE_SECONDS
+    projected: list[dict] = []
+    for _effective_activity, root in candidates:
+        tip = compression_tip(root)
+        tip_activity = activity(tip)
+        if tip_activity < cutoff:
+            continue
+        row = dict(root)
+        for field in (
+            "id",
+            "ended_at",
+            "end_reason",
+            "message_count",
+            "title",
+            "model",
+            "archived",
+            "hidden",
+            "pinned",
+            "cwd",
+        ):
+            if field in tip:
+                row[field] = tip[field]
+        row["source"] = "desktop"
+        row["last_activity"] = tip_activity
+        row["last_active"] = tip_activity
+        row["actual_message_count"] = row.get("message_count") or 0
+        row["actual_user_message_count"] = None
+        row["_lineage_tip_id"] = tip.get("id") or root.get("id")
+        if tip.get("id") != root.get("id"):
+            row["_lineage_root_id"] = root.get("id")
+        for internal in ("_row_activity", "_branched_from", "_delegate_from"):
+            row.pop(internal, None)
+        projected.append(_with_normalized_source(row))
+        if len(projected) >= page_limit:
+            break
+    return projected
+
+
 def read_desktop_session_rows(
     db_path: Path,
     log=None,
@@ -621,15 +875,11 @@ def read_desktop_session_rows(
 ) -> list[dict]:
     """Return the first bounded page of native Desktop logical sessions.
 
-    Desktop lists history through ``SessionDB.list_sessions_rich``. Reuse that
-    indexed projection instead of applying WebUI's generic 20-row bridge cap or
-    maintaining another unbounded SQL scan over a potentially large ``state.db``.
-    The native projection already collapses compression continuations, hides
-    subagent children, and includes archived Desktop conversations.
-
-    Older Hermes Agent installs may not expose this API. In that compatibility
-    case, fall back to WebUI's generic projector in strict read-only mode. Native
-    operational failures do not launch a second scan against the same database.
+    Hermex keeps this path sessions-table-only (newest 15, ≤7 days) so sidebar
+    refresh and session-open metadata never JOIN or GROUP the multi-GB messages
+    store. Compression lineage is collapsed onto the tip id without scanning
+    messages. When the schema cannot support the fast projection, fall back to
+    WebUI's generic projector in strict read-only mode (compatibility only).
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -640,6 +890,12 @@ def read_desktop_session_rows(
     if page_limit == 0:
         return []
 
+    fast = _project_bounded_desktop_rows(db_path, log=log, limit=page_limit)
+    if fast is not None:
+        return fast
+
+    # Schema cannot support the sessions-only projection. Prefer native SessionDB
+    # when available; otherwise the generic importable reader (strict read-only).
     db = None
     native_rows = None
     compatibility_fallback = False
@@ -710,7 +966,7 @@ def read_desktop_session_rows(
     if compatibility_fallback:
         log.debug("Native Desktop projection API unavailable; using compatibility reader")
         try:
-            return read_importable_agent_session_rows(
+            rows = read_importable_agent_session_rows(
                 db_path,
                 limit=page_limit,
                 log=log,
@@ -721,18 +977,34 @@ def read_desktop_session_rows(
         except Exception:
             log.warning("Desktop compatibility projection failed", exc_info=True)
             return []
+        cutoff = time.time() - DESKTOP_SESSION_MAX_AGE_SECONDS
+        kept = []
+        for row in rows:
+            ts = _as_epoch(row.get("last_activity") or row.get("started_at"))
+            if ts >= cutoff:
+                kept.append(row)
+            if len(kept) >= page_limit:
+                break
+        return kept
 
     projected = []
+    cutoff = time.time() - DESKTOP_SESSION_MAX_AGE_SECONDS
     try:
         for native_row in native_rows or ():
             row = dict(native_row)
+            tip_activity = _as_epoch(row.get("last_active") or row.get("started_at"))
+            if tip_activity < cutoff:
+                continue
             row["source"] = row.get("source") or "desktop"
             row["raw_source"] = row.get("raw_source") or row["source"]
-            row["last_activity"] = row.get("last_active") or row.get("started_at")
+            row["last_activity"] = tip_activity
+            row["last_active"] = tip_activity
             row["actual_message_count"] = row.get("message_count") or 0
             row["actual_user_message_count"] = None
             row["_lineage_tip_id"] = row.get("_lineage_tip_id") or row.get("id")
             projected.append(_with_normalized_source(row))
+            if len(projected) >= page_limit:
+                break
     except Exception:
         log.warning("Native Desktop session rows were malformed", exc_info=True)
         return []

@@ -1,6 +1,7 @@
 """Regression coverage for preserving native Hermes session workspaces in WebUI."""
 
 import json
+import time
 import sqlite3
 import sys
 from types import SimpleNamespace
@@ -51,16 +52,18 @@ def _make_desktop_state_db(
         conn.execute(
             "CREATE INDEX idx_messages_session ON messages(session_id, timestamp)"
         )
+    now = time.time()
     conn.execute(
         """
         INSERT INTO sessions (
             id, source, session_source, title, model, started_at, message_count, cwd,
             archived
-        ) VALUES (?, ?, 'other', 'Desktop chat', 'test/model', 1000.0, 2, ?, ?)
+        ) VALUES (?, ?, 'other', 'Desktop chat', 'test/model', ?, 2, ?, ?)
         """,
         (
             "desktop-session",
             source,
+            now,
             str(cwd) if cwd is not None else None,
             int(bool(archived)),
         ),
@@ -68,8 +71,8 @@ def _make_desktop_state_db(
     conn.executemany(
         "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?, 'desktop-session', ?, ?, ?)",
         [
-            ("m1", "user", "hello", 1001.0),
-            ("m2", "assistant", "hi", 1002.0),
+            ("m1", "user", "hello", now + 1),
+            ("m2", "assistant", "hi", now + 2),
         ],
     )
     conn.commit()
@@ -104,8 +107,8 @@ def test_desktop_reader_reuses_native_logical_projection_and_closes(monkeypatch,
                 "source": "desktop",
                 "title": "Native Desktop chat",
                 "message_count": 4,
-                "started_at": 10.0,
-                "last_active": 20.0,
+                "started_at": time.time() - 10.0,
+                "last_active": time.time() - 5.0,
                 "cwd": None,
                 "archived": True,
                 "_lineage_root_id": "desktop-root",
@@ -122,7 +125,7 @@ def test_desktop_reader_reuses_native_logical_projection_and_closes(monkeypatch,
     assert seen["read_only"] is True
     assert seen["kwargs"] == {
         "source": "desktop",
-        "limit": 200,
+        "limit": 15,
         "offset": 0,
         "order_by_last_active": True,
         "compact_rows": True,
@@ -131,24 +134,21 @@ def test_desktop_reader_reuses_native_logical_projection_and_closes(monkeypatch,
         "min_message_count": 1,
     }
     assert seen["closed"] is True
-    assert rows == [{
-        "id": "desktop-tip",
-        "source": "desktop",
-        "title": "Native Desktop chat",
-        "message_count": 4,
-        "started_at": 10.0,
-        "last_active": 20.0,
-        "cwd": None,
-        "archived": True,
-        "_lineage_root_id": "desktop-root",
-        "raw_source": "desktop",
-        "last_activity": 20.0,
-        "actual_message_count": 4,
-        "actual_user_message_count": None,
-        "_lineage_tip_id": "desktop-tip",
-        "session_source": "cli",
-        "source_label": "Desktop",
-    }]
+    assert len(rows) == 1
+    assert rows[0]["id"] == "desktop-tip"
+    assert rows[0]["source"] == "desktop"
+    assert rows[0]["title"] == "Native Desktop chat"
+    assert rows[0]["message_count"] == 4
+    assert rows[0]["archived"] is True
+    assert rows[0]["_lineage_root_id"] == "desktop-root"
+    assert rows[0]["raw_source"] == "desktop"
+    assert rows[0]["actual_message_count"] == 4
+    assert rows[0]["actual_user_message_count"] is None
+    assert rows[0]["_lineage_tip_id"] == "desktop-tip"
+    assert rows[0]["session_source"] == "cli"
+    assert rows[0]["source_label"] == "Desktop"
+    assert rows[0]["last_activity"] == rows[0]["last_active"]
+    assert rows[0]["last_activity"] > time.time() - 60
 
 
 def test_desktop_reader_clamps_requested_page_limit(monkeypatch, tmp_path):
@@ -170,7 +170,7 @@ def test_desktop_reader_clamps_requested_page_limit(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "hermes_state", SimpleNamespace(SessionDB=FakeSessionDB))
 
     assert read_desktop_session_rows(db_path, limit=10_000) == []
-    assert seen["limit"] == 1000
+    assert seen["limit"] == 15
     assert seen["offset"] == 0
     assert seen["closed"] is True
 
@@ -193,13 +193,14 @@ def test_desktop_reader_closes_native_handle_before_compatibility_fallback(monke
     def compatibility_reader(*args, **kwargs):
         assert seen["closed"] is True
         seen["compatibility_kwargs"] = kwargs
-        return [{"id": "compat-desktop"}]
+        return [{"id": "compat-desktop", "started_at": time.time(), "last_activity": time.time()}]
 
     monkeypatch.setitem(sys.modules, "hermes_state", SimpleNamespace(SessionDB=BrokenSessionDB))
     monkeypatch.setattr(agent_sessions, "read_importable_agent_session_rows", compatibility_reader)
 
-    assert read_desktop_session_rows(db_path) == [{"id": "compat-desktop"}]
-    assert seen["compatibility_kwargs"]["limit"] == 200
+    rows = read_desktop_session_rows(db_path)
+    assert [r["id"] for r in rows] == ["compat-desktop"]
+    assert seen["compatibility_kwargs"]["limit"] == 15
     assert seen["compatibility_kwargs"]["strict_read_only"] is True
 
 

@@ -149,6 +149,7 @@ def test_agent_cache_max_default_is_bounded():
 
 
 # ─────────────────────── Fix 3: cheap watcher fingerprint ────────────────────
+# Hermex U5: fingerprint is Desktop-only, sessions-table-only (no messages JOIN).
 
 def _make_db(tmp_path: Path):
     db = tmp_path / "state.db"
@@ -161,12 +162,14 @@ def _make_db(tmp_path: Path):
             session_source TEXT,
             model TEXT,
             started_at REAL NOT NULL,
+            last_activity_at REAL,
             ended_at REAL,
             end_reason TEXT,
             parent_session_id TEXT,
             message_count INTEGER DEFAULT 0,
             title TEXT,
-            archived INTEGER DEFAULT 0
+            archived INTEGER DEFAULT 0,
+            model_config TEXT
         );
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,12 +184,13 @@ def _make_db(tmp_path: Path):
     return db, conn
 
 
-def _add_session(conn, sid, source="telegram", mc=2, started=None, title="Chat"):
+def _add_session(conn, sid, source="desktop", mc=2, started=None, title="Chat"):
     started = started or time.time()
     conn.execute(
-        "INSERT OR REPLACE INTO sessions (id, source, model, started_at, message_count, title) "
-        "VALUES (?, ?, 'm', ?, ?, ?)",
-        (sid, source, started, mc, title),
+        "INSERT OR REPLACE INTO sessions "
+        "(id, source, model, started_at, last_activity_at, message_count, title) "
+        "VALUES (?, ?, 'm', ?, ?, ?, ?)",
+        (sid, source, started, started, mc, title),
     )
     for i in range(mc):
         conn.execute(
@@ -199,108 +203,94 @@ def _add_session(conn, sid, source="telegram", mc=2, started=None, title="Chat")
 def test_cheap_fingerprint_stable_and_sensitive(tmp_path):
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
-    _add_session(conn, "tg1", "telegram", mc=2)
-    _add_session(conn, "dc1", "discord", mc=3)
+    _add_session(conn, "desk1", "desktop", mc=2)
+    _add_session(conn, "desk2", "desktop", mc=3)
 
     fp1 = gw._cheap_change_fingerprint(db)
     fp2 = gw._cheap_change_fingerprint(db)
     assert fp1 is not None
     assert fp1 == fp2, "fingerprint must be stable when nothing changes"
 
-    # New message in a visible session bumps message_count -> fingerprint changes.
-    _add_session(conn, "tg1", "telegram", mc=3)
+    # New message in a visible Desktop session bumps message_count -> fingerprint changes.
+    _add_session(conn, "desk1", "desktop", mc=3)
     fp3 = gw._cheap_change_fingerprint(db)
     assert fp3 != fp1, "fingerprint must change when a visible session gains a message"
 
-    # New session appears -> fingerprint changes.
-    _add_session(conn, "tg2", "telegram", mc=1)
+    # New Desktop session appears -> fingerprint changes.
+    _add_session(conn, "desk3", "desktop", mc=1)
     fp4 = gw._cheap_change_fingerprint(db)
     assert fp4 != fp3
 
 
 def test_cheap_fingerprint_ignores_excluded_sources(tmp_path):
-    """cron/webui churn must not invalidate the fingerprint (matches projection scope)."""
+    """Non-Desktop churn must not invalidate the Desktop-only fingerprint."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
-    _add_session(conn, "tg1", "telegram", mc=2)
+    _add_session(conn, "desk1", "desktop", mc=2)
     fp1 = gw._cheap_change_fingerprint(db)
 
-    # A cron session churns heavily — but cron is excluded from the sidebar, so
-    # the fingerprint (and thus the expensive projection) must NOT fire.
+    # Telegram / cron / webui churn is outside the Desktop projection.
+    _add_session(conn, "tg1", "telegram", mc=50)
     _add_session(conn, "cron1", "cron", mc=50)
-    fp2 = gw._cheap_change_fingerprint(db)
-    assert fp2 == fp1, "cron-only churn must not trigger a re-projection"
-
-    # A webui session likewise excluded.
     _add_session(conn, "webui1", "webui", mc=20)
-    fp3 = gw._cheap_change_fingerprint(db)
-    assert fp3 == fp1
+    fp2 = gw._cheap_change_fingerprint(db)
+    assert fp2 == fp1, "non-Desktop churn must not trigger a re-projection"
 
 
 def test_cheap_fingerprint_detects_source_change(tmp_path):
-    """A source retag changes the projection's derived source_label / visibility,
-    so the cheap fingerprint MUST change even though no displayed field moved."""
+    """Retagging a Desktop row away from desktop removes it from the projection."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
-    _add_session(conn, "s1", "telegram", mc=2)
+    _add_session(conn, "s1", "desktop", mc=2)
     fp1 = gw._cheap_change_fingerprint(db)
 
-    conn.execute("UPDATE sessions SET source = 'discord' WHERE id = 's1'")
+    conn.execute("UPDATE sessions SET source = 'telegram' WHERE id = 's1'")
     conn.commit()
     fp2 = gw._cheap_change_fingerprint(db)
-    assert fp2 != fp1, "a source change alters projected metadata and must be detected"
+    assert fp2 != fp1, "leaving the Desktop projection must change the fingerprint"
 
 
-def test_cheap_fingerprint_detects_same_count_message_rewrite(tmp_path):
-    """Regression (#3536 review): SessionDB.replace_messages (/retry, /undo,
-    /compress) deletes + reinserts a transcript with NEW timestamps but can leave
-    sessions.message_count UNCHANGED. The projection's last_activity
-    (MAX(messages.timestamp)) moves, so the cheap fingerprint MUST still change
-    even though every sessions-table column is identical — otherwise the watcher
-    skips a re-projection and other tabs show stale last_activity ordering."""
+def test_cheap_fingerprint_ignores_message_table_rewrites(tmp_path):
+    """U5: fingerprint is sessions-table-only; message rewrites without sessions
+    column changes must NOT invalidate it (no messages JOIN / GROUP BY)."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
-    _add_session(conn, "s1", "telegram", mc=3)
+    _add_session(conn, "s1", "desktop", mc=3)
     fp1 = gw._cheap_change_fingerprint(db)
 
-    # Simulate replace_messages: same count (3), brand-new timestamps, no change
-    # to ANY sessions-table column (message_count stays 3).
     conn.execute("DELETE FROM messages WHERE session_id = 's1'")
-    base = time.time() + 10_000  # strictly later than the originals
+    base = time.time() + 10_000
     for i in range(3):
         conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'rewritten', ?)",
             ("s1", base + i),
         )
     conn.commit()
-    # sessions table is byte-identical to before; only messages moved.
     assert conn.execute("SELECT message_count FROM sessions WHERE id='s1'").fetchone()[0] == 3
     fp2 = gw._cheap_change_fingerprint(db)
-    assert fp2 != fp1, (
-        "a same-count transcript rewrite moves MAX(messages.timestamp) and must "
-        "invalidate the fingerprint so the watcher re-projects"
-    )
+    assert fp2 == fp1, "message-only rewrites must not touch the sessions-only fingerprint"
 
 
 def test_cheap_fingerprint_detects_lineage_only_change(tmp_path):
     """Lineage/visibility fields the projection uses for collapse (parent_session_id,
-    end_reason, ended_at) must be part of the fingerprint."""
+    end_reason, ended_at) must be part of the fingerprint for Desktop rows."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
-    _add_session(conn, "s1", "telegram", mc=2)
+    # Root + tip style: a standalone desktop root, then mutate lineage fields.
+    _add_session(conn, "s1", "desktop", mc=2)
     fp0 = gw._cheap_change_fingerprint(db)
 
-    conn.execute("UPDATE sessions SET parent_session_id = 'p-root' WHERE id = 's1'")
+    conn.execute("UPDATE sessions SET title = 'Renamed' WHERE id = 's1'")
     conn.commit()
     fp1 = gw._cheap_change_fingerprint(db)
-    assert fp1 != fp0, "parent_session_id change (compression lineage) must be detected"
+    assert fp1 != fp0, "title change on a visible Desktop row must be detected"
 
-    conn.execute("UPDATE sessions SET end_reason = 'compressed' WHERE id = 's1'")
+    conn.execute("UPDATE sessions SET end_reason = 'compression' WHERE id = 's1'")
     conn.commit()
     fp2 = gw._cheap_change_fingerprint(db)
     assert fp2 != fp1, "end_reason change must be detected"
 
-    conn.execute("UPDATE sessions SET ended_at = 1234567890.0 WHERE id = 's1'")
+    conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's1'", (time.time(),))
     conn.commit()
     fp3 = gw._cheap_change_fingerprint(db)
     assert fp3 != fp2, "ended_at change must be detected"
@@ -339,7 +329,7 @@ def test_cheap_fingerprint_handles_missing_optional_columns(tmp_path):
     )
     conn.execute(
         "INSERT INTO sessions (id, source, model, started_at, message_count, title) "
-        "VALUES ('s1', 'telegram', 'm', ?, 2, 't')",
+        "VALUES ('s1', 'desktop', 'm', ?, 2, 't')",
         (time.time(),),
     )
     conn.commit()
@@ -358,10 +348,10 @@ def test_cheap_fingerprint_returns_none_without_source_column(tmp_path):
 
 
 def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
-    """The poll body must call the expensive projection only when the cheap fp changes."""
+    """The poll body must call the projection only when the cheap fp changes."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
-    _add_session(conn, "tg1", "telegram", mc=2)
+    _add_session(conn, "desk1", "desktop", mc=2)
 
     monkeypatch.setattr(gw, "_get_state_db_path", lambda: db)
 
@@ -374,7 +364,7 @@ def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gw, "_get_agent_sessions_from_db", counting)
 
-    w = gw.GatewayWatcher()
+    w = gw.GatewayWatcher(state_db_path=db)
 
     # Run the change-detection body directly (one iteration) without the thread.
     def one_iteration():
@@ -393,7 +383,7 @@ def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
     one_iteration()  # still unchanged: must skip
     assert calls["n"] == 1, "expensive projection must not run while state is unchanged"
 
-    _add_session(conn, "tg1", "telegram", mc=3)  # a real change
+    _add_session(conn, "desk1", "desktop", mc=3)  # a real change
     one_iteration()
     assert calls["n"] == 2, "expensive projection must run again after a real change"
 
