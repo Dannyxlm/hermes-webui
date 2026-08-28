@@ -133,6 +133,10 @@ def _clean_git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         if key.startswith(_GIT_ENV_SCRUB_PREFIXES):
             env.pop(key, None)
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # Git error classification relies on stable porcelain diagnostics. Force the
+    # C locale after applying caller overrides so non-repositories and real
+    # failures are classified consistently on localized hosts.
+    env["LC_ALL"] = "C"
     return env
 
 
@@ -470,15 +474,38 @@ def _block_filtered_destructive_write(ctx: GitContext, message: str) -> None:
 
 def resolve_git_context(workspace: str | Path) -> GitContext | None:
     ws = Path(workspace).expanduser().resolve()
-    result = _run_git(ws, ["rev-parse", "--show-toplevel"], check=False)
-    if result.returncode != 0:
-        return None
+    try:
+        result = _run_git(ws, ["rev-parse", "--show-toplevel"], check=True)
+    except GitWorkspaceError as exc:
+        if exc.code == "not_a_repo":
+            return None
+        raise
     repo_root = Path(result.stdout.strip()).resolve()
     try:
         prefix = ws.relative_to(repo_root).as_posix()
     except ValueError:
         return None
     return GitContext(workspace=ws, repo_root=repo_root, workspace_prefix="" if prefix == "." else prefix)
+
+
+def git_info(workspace: str | Path) -> dict | None:
+    """Return only repository availability and the current branch.
+
+    This is the chat-toolbar cold-path probe. It deliberately avoids ``git status``,
+    diff statistics, untracked-file enumeration, upstream traversal, and branch-list
+    construction. ``resolve_git_context`` keeps nested workspaces and linked worktrees
+    correct while reusing the hardened Git subprocess boundary.
+    """
+    ctx = resolve_git_context(workspace)
+    if ctx is None:
+        return None
+    branch_result = _run_git(ctx, ["branch", "--show-current"], check=True)
+    branch = branch_result.stdout.strip()
+    return {
+        "branch": branch,
+        "is_git": True,
+        "repo_root": str(ctx.repo_root),
+    }
 
 
 def _workspace_pathspec(ctx: GitContext) -> str:
