@@ -794,12 +794,8 @@ async function _refreshGitBadge(){
     if(!S.session||S.session.session_id!==sessionId)return;
     if(data.git&&data.git.is_git){
       const g=data.git;
-      let text=g.branch||'git';
-      if(g.dirty>0) text+=` \u00b7 ${g.dirty}\u2206`; // middot + delta
-      if(g.behind>0) text+=` \u2193${g.behind}`;
-      if(g.ahead>0) text+=` \u2191${g.ahead}`;
-      badge.textContent=text;
-      badge.className='git-badge'+(g.dirty>0?' dirty':'');
+      badge.textContent=g.branch||'git';
+      badge.className='git-badge';
       badge.style.display='';
     } else {
       badge.style.display='none';

@@ -80,7 +80,13 @@ def test_gateway_watcher_pins_explicit_profile_home(tmp_path, monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(gw, "read_importable_agent_session_rows", fake_rows)
+    monkeypatch.setattr(gw, "read_desktop_session_rows", fake_rows)
+    # Watcher projection goes through the bounded Desktop reader helper.
+    monkeypatch.setattr(
+        gw,
+        "_desktop_watcher_rows",
+        lambda db_path: fake_rows(db_path),
+    )
     monkeypatch.setattr(
         gw,
         "_get_state_db_path",

@@ -13316,25 +13316,15 @@ def handle_get(handler, parsed) -> bool:
         if not sid:
             return bad(handler, "session_id required")
         try:
-            s = get_session(sid)
+            s = get_session(sid, metadata_only=True)
         except KeyError:
             return bad(handler, "Session not found", 404)
-        from api.workspace_git import GitWorkspaceError, git_status
+        from api.workspace_git import GitWorkspaceError, git_info
 
         try:
-            status = git_status(Path(s.workspace))
+            info = git_info(Path(s.workspace))
         except GitWorkspaceError as e:
             return _git_bad(handler, e)
-        totals = status.get("totals") or {}
-        info = None if not status.get("is_git") else {
-            "branch": status.get("branch"),
-            "dirty": totals.get("changed", 0),
-            "modified": (totals.get("staged", 0) or 0) + (totals.get("unstaged", 0) or 0),
-            "untracked": totals.get("untracked", 0),
-            "ahead": status.get("ahead", 0),
-            "behind": status.get("behind", 0),
-            "is_git": True,
-        }
         return j(handler, {"git": info})
 
     if parsed.path == "/api/commands":

@@ -139,7 +139,7 @@ work has shifted from "reach parity" to "harden reliability + widen distribution
 - [x] File preview auto-close on directory navigation
 - [x] Right panel resizable (drag inner edge)
 - [x] Embedded workspace terminal (`/api/terminal/{start,input,output}`)
-- [x] Git branch + dirty status badge in workspace header
+- [x] Lightweight Git branch badge in workspace header
 
 ### Cron jobs
 - [x] List all cron jobs (Tasks sidebar tab)

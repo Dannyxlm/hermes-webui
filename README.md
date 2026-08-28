@@ -241,7 +241,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Edit, create, delete, and rename files; create folders
 - Binary file download (auto-detected from server)
 - File preview auto-closes on directory navigation (with unsaved-edit guard)
-- Git detection -- branch name and dirty file count badge in workspace header
+- Git detection -- a lightweight branch badge in the workspace header; expensive status/diff details stay off the initial file-browser path
 - Right panel is drag-resizable
 - Syntax highlighted code preview (Prism.js)
 
